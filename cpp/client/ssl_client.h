@@ -1,24 +1,27 @@
-/* -*- mode: c++; indent-tabs-mode: nil -*- */
-#ifndef SSL_CLIENT_H
-#define SSL_CLIENT_H
+#ifndef CERT_TRANS_CLIENT_SSL_CLIENT_H_
+#define CERT_TRANS_CLIENT_SSL_CLIENT_H_
 
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include "base/macros.h"
 #include "client/client.h"
 #include "client/ssl_client.h"
 #include "log/log_verifier.h"
 #include "proto/ct.pb.h"
-#include "base/macros.h"
+#include "util/openssl_scoped_ssl_types.h"
 
 class LogVerifier;
+
+namespace cert_trans {
+
 
 class SSLClient {
  public:
   // Takes ownership of the verifier. This client can currently
   // only verify SCTs from a single log at a time.
   // TODO(ekasper): implement a proper multi-log auditor.
-  SSLClient(const std::string& server, uint16_t port,
+  SSLClient(const std::string& server, const std::string& port,
             const std::string& ca_dir, LogVerifier* verifier);
 
   ~SSLClient();
@@ -45,9 +48,9 @@ class SSLClient {
   void GetSSLClientCTData(ct::SSLClientCTData* data) const;
 
   // Need a static wrapper for the callback.
-  static LogVerifier::VerifyResult VerifySCT(const std::string& token,
-                                             LogVerifier* verifier,
-                                             ct::SSLClientCTData* data);
+  static LogVerifier::LogVerifyResult VerifySCT(const std::string& token,
+                                                LogVerifier* verifier,
+                                                ct::SSLClientCTData* data);
 
   // Custom verification callback for verifying the SCT token
   // in a superfluous certificate. Return values:
@@ -71,8 +74,8 @@ class SSLClient {
 
  private:
   Client client_;
-  SSL_CTX* ctx_;
-  SSL* ssl_;
+  cert_trans::ScopedSSL_CTX ctx_;
+  cert_trans::ScopedSSL ssl_;
   struct VerifyCallbackArgs {
     VerifyCallbackArgs(LogVerifier* log_verifier)
         : verifier(log_verifier),
@@ -82,7 +85,7 @@ class SSLClient {
     }
 
     // The verifier for checking log proofs.
-    LogVerifier* verifier;
+    std::unique_ptr<LogVerifier> verifier;
     // SCT verification result.
     bool sct_verified;
     bool require_sct;
@@ -103,4 +106,8 @@ class SSLClient {
 
   DISALLOW_COPY_AND_ASSIGN(SSLClient);
 };
-#endif
+
+
+}  // namespace cert_trans
+
+#endif  // CERT_TRANS_CLIENT_SSL_CLIENT_H_

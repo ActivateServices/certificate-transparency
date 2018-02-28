@@ -1,58 +1,93 @@
-/* -*- mode: c++; indent-tabs-mode: nil -*- */
+#ifndef CERT_TRANS_LOG_SQLITE_DB_H_
+#define CERT_TRANS_LOG_SQLITE_DB_H_
 
-#ifndef SQLITE_DB_H
-#define SQLITE_DB_H
+#include <mutex>
 #include <string>
 
 #include "base/macros.h"
 #include "log/database.h"
+#include "log/logged_entry.h"
 
 struct sqlite3;
 
-template <class Logged>
-class SQLiteDB : public Database<Logged> {
+namespace cert_trans {
+
+
+class SQLiteDB : public Database {
  public:
   explicit SQLiteDB(const std::string& dbfile);
 
   ~SQLiteDB();
 
-  typedef typename Database<Logged>::WriteResult WriteResult;
-  typedef typename Database<Logged>::LookupResult LookupResult;
+  typedef Database::WriteResult WriteResult;
+  typedef Database::LookupResult LookupResult;
 
-  // Temporary, for benchmarking. If we want to do this for real, then
-  // we need to implement rollbacks for errors that occur in the middle
-  // of a transaction.
-  virtual bool Transactional() const {
-    return true;
-  }
+  WriteResult CreateSequencedEntry_(const LoggedEntry& logged) override;
 
-  void BeginTransaction();
+  LookupResult LookupByHash(const std::string& hash,
+                            LoggedEntry* result) const override;
 
-  void EndTransaction();
+  LookupResult LookupByIndex(int64_t sequence_number,
+                             LoggedEntry* result) const override;
 
-  virtual WriteResult CreatePendingEntry_(const Logged& logged);
+  std::unique_ptr<Database::Iterator> ScanEntries(
+      int64_t start_index) const override;
 
-  virtual WriteResult AssignSequenceNumber(const std::string& pending_hash,
-                                           uint64_t sequence_number);
+  WriteResult WriteTreeHead_(const ct::SignedTreeHead& sth) override;
 
-  virtual LookupResult LookupByHash(const std::string& hash) const;
+  LookupResult LatestTreeHead(ct::SignedTreeHead* result) const override;
 
-  virtual LookupResult LookupByHash(const std::string& hash,
-                                    Logged* result) const;
+  int64_t TreeSize() const override;
 
-  virtual LookupResult LookupByIndex(uint64_t sequence_number,
-                                     Logged* result) const;
+  void AddNotifySTHCallback(
+      const Database::NotifySTHCallback* callback) override;
 
-  virtual std::set<std::string> PendingHashes() const;
+  void RemoveNotifySTHCallback(
+      const Database::NotifySTHCallback* callback) override;
 
-  virtual WriteResult WriteTreeHead_(const ct::SignedTreeHead& sth);
+  void InitializeNode(const std::string& node_id) override;
+  LookupResult NodeId(std::string* node_id) override;
 
-  virtual LookupResult LatestTreeHead(ct::SignedTreeHead* result) const;
+  // Force an STH notification. This is needed only for ct-dns-server,
+  // which shares a SQLite database with ct-server, but needs to
+  // refresh itself occasionally.
+  void ForceNotifySTH();
 
  private:
-  sqlite3* db_;
+  class Iterator;
+
+  LookupResult LookupByIndex(const std::unique_lock<std::mutex>& lock,
+                             int64_t sequence_number,
+                             LoggedEntry* result) const;
+  // This finds the next entry with a sequence number equal or greater
+  // to the one specified.
+  LookupResult LookupNextIndex(const std::unique_lock<std::mutex>& lock,
+                               int64_t sequence_number,
+                               LoggedEntry* result) const;
+  LookupResult LatestTreeHeadNoLock(const std::unique_lock<std::mutex>& lock,
+                                    ct::SignedTreeHead* result) const;
+  LookupResult NodeId(const std::unique_lock<std::mutex>& lock,
+                      std::string* node_id);
+
+  void BeginTransaction(const std::unique_lock<std::mutex>& lock);
+
+  void EndTransaction(const std::unique_lock<std::mutex>& lock);
+
+  void MaybeStartNewTransaction(const std::unique_lock<std::mutex>& lock);
+
+  mutable std::mutex lock_;
+  sqlite3* const db_;
+  // This is marked mutable, as it is a lazily updated cache updated
+  // from some of the getters.
+  mutable int64_t tree_size_;
+  DatabaseNotifierHelper callbacks_;
+  int64_t transaction_size_;
+  bool in_transaction_;
 
   DISALLOW_COPY_AND_ASSIGN(SQLiteDB);
 };
 
-#endif
+
+}  // namespace cert_trans
+
+#endif  // CERT_TRANS_LOG_SQLITE_DB_H_

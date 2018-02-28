@@ -3,8 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string>
 #include <time.h>
+#include <string>
 #include <vector>
 
 #include "merkletree/compact_merkle_tree.h"
@@ -18,6 +18,7 @@
 namespace {
 
 using std::string;
+using std::unique_ptr;
 
 // REFERENCE IMPLEMENTATIONS
 
@@ -128,7 +129,7 @@ class MerkleTreeTest : public ::testing::Test {
  protected:
   TreeHasher tree_hasher_;
   std::vector<string> data_;
-  MerkleTreeTest() : tree_hasher_(new Sha256Hasher()) {
+  MerkleTreeTest() : tree_hasher_(unique_ptr<Sha256Hasher>(new Sha256Hasher)) {
     for (int i = 0; i < 256; ++i)
       data_.push_back(string(1, i));
   }
@@ -156,12 +157,16 @@ class CompactMerkleTreeFuzzTest : public MerkleTreeFuzzTest {
   }
 };
 
+unique_ptr<Sha256Hasher> NewSha256Hasher() {
+  return unique_ptr<Sha256Hasher>(new Sha256Hasher);
+}
+
 // FUZZ TESTS AGAINST REFERENCE IMPLEMENTATIONS
 
 // Make random root queries and check against the reference hash.
 TEST_F(MerkleTreeFuzzTest, RootFuzz) {
   for (size_t tree_size = 1; tree_size <= data_.size(); ++tree_size) {
-    MerkleTree tree(new Sha256Hasher());
+    MerkleTree tree(NewSha256Hasher());
     for (size_t j = 0; j < tree_size; ++j)
       tree.AddLeaf(data_[j]);
     // Since the tree is evaluated lazily, the order of queries is significant.
@@ -178,7 +183,7 @@ TEST_F(MerkleTreeFuzzTest, RootFuzz) {
 
 TEST_F(CompactMerkleTreeTest, RootFuzz) {
   for (size_t tree_size = 1; tree_size <= data_.size(); ++tree_size) {
-    CompactMerkleTree tree(new Sha256Hasher());
+    CompactMerkleTree tree(NewSha256Hasher());
     for (size_t j = 0; j < tree_size; ++j) {
       tree.AddLeaf(data_[j]);
       // Since the tree is evaluated lazily, the tree state is significant
@@ -195,7 +200,7 @@ TEST_F(CompactMerkleTreeTest, RootFuzz) {
 // Make random path queries and check against the reference implementation.
 TEST_F(MerkleTreeFuzzTest, PathFuzz) {
   for (size_t tree_size = 1; tree_size <= data_.size(); ++tree_size) {
-    MerkleTree tree(new Sha256Hasher());
+    MerkleTree tree(NewSha256Hasher());
     for (size_t j = 0; j < tree_size; ++j)
       tree.AddLeaf(data_[j]);
 
@@ -216,7 +221,7 @@ TEST_F(MerkleTreeFuzzTest, PathFuzz) {
 // Make random proof queries and check against the reference implementation.
 TEST_F(MerkleTreeFuzzTest, ConsistencyFuzz) {
   for (size_t tree_size = 1; tree_size <= data_.size(); ++tree_size) {
-    MerkleTree tree(new Sha256Hasher());
+    MerkleTree tree(NewSha256Hasher());
     for (size_t j = 0; j < tree_size; ++j)
       tree.AddLeaf(data_[j]);
 
@@ -280,7 +285,7 @@ const TestVector kSHA256Roots[8] = {
 
 TEST_F(MerkleTreeTest, RootTestVectors) {
   // The first tree: add nodes one by one.
-  MerkleTree tree1(new Sha256Hasher());
+  MerkleTree tree1(NewSha256Hasher());
   EXPECT_EQ(tree1.LeafCount(), 0U);
   EXPECT_EQ(tree1.LevelCount(), 0U);
   EXPECT_STREQ(H(tree1.CurrentRoot()).c_str(), kSHA256EmptyTreeHash.str);
@@ -301,7 +306,7 @@ TEST_F(MerkleTreeTest, RootTestVectors) {
   }
 
   // The second tree: add all nodes at once.
-  MerkleTree tree2(new Sha256Hasher());
+  MerkleTree tree2(NewSha256Hasher());
   for (int i = 0; i < 8; ++i) {
     tree2.AddLeaf(S(kInputs[i]));
   }
@@ -310,7 +315,7 @@ TEST_F(MerkleTreeTest, RootTestVectors) {
   EXPECT_STREQ(H(tree2.CurrentRoot()).c_str(), kSHA256Roots[7].str);
 
   // The third tree: add nodes in two chunks.
-  MerkleTree tree3(new Sha256Hasher());
+  MerkleTree tree3(NewSha256Hasher());
   // Add three nodes.
   for (int i = 0; i < 3; ++i) {
     tree3.AddLeaf(S(kInputs[i]));
@@ -329,7 +334,7 @@ TEST_F(MerkleTreeTest, RootTestVectors) {
 
 TEST_F(CompactMerkleTreeTest, RootTestVectors) {
   // The first tree: add nodes one by one.
-  CompactMerkleTree tree1(new Sha256Hasher());
+  CompactMerkleTree tree1(NewSha256Hasher());
   EXPECT_EQ(tree1.LeafCount(), 0U);
   EXPECT_EQ(tree1.LevelCount(), 0U);
   EXPECT_STREQ(H(tree1.CurrentRoot()).c_str(), kSHA256EmptyTreeHash.str);
@@ -341,7 +346,7 @@ TEST_F(CompactMerkleTreeTest, RootTestVectors) {
   }
 
   // The second tree: add all nodes at once.
-  CompactMerkleTree tree2(new Sha256Hasher());
+  CompactMerkleTree tree2(NewSha256Hasher());
   for (int i = 0; i < 8; ++i) {
     tree2.AddLeaf(S(kInputs[i]));
   }
@@ -350,7 +355,7 @@ TEST_F(CompactMerkleTreeTest, RootTestVectors) {
   EXPECT_STREQ(H(tree2.CurrentRoot()).c_str(), kSHA256Roots[7].str);
 
   // The third tree: add nodes in two chunks.
-  CompactMerkleTree tree3(new Sha256Hasher());
+  CompactMerkleTree tree3(NewSha256Hasher());
   // Add three nodes.
   for (int i = 0; i < 3; ++i) {
     tree3.AddLeaf(S(kInputs[i]));
@@ -368,8 +373,8 @@ TEST_F(CompactMerkleTreeTest, RootTestVectors) {
 }
 
 TEST_F(CompactMerkleTreeTest, TestCopyCtorWithRootTestVectors) {
-  MerkleTree tree1(new Sha256Hasher());
-  CompactMerkleTree refctree1(new Sha256Hasher());
+  MerkleTree tree1(NewSha256Hasher());
+  CompactMerkleTree refctree1(NewSha256Hasher());
   EXPECT_EQ(tree1.LeafCount(), 0U);
   EXPECT_EQ(tree1.LevelCount(), 0U);
   EXPECT_STREQ(H(tree1.CurrentRoot()).c_str(), kSHA256EmptyTreeHash.str);
@@ -381,14 +386,14 @@ TEST_F(CompactMerkleTreeTest, TestCopyCtorWithRootTestVectors) {
   EXPECT_EQ(tree1.LevelCount(), kLevelCounts[7]);
   EXPECT_STREQ(H(tree1.CurrentRoot()).c_str(), kSHA256Roots[7].str);
 
-  CompactMerkleTree ctree1(tree1, new Sha256Hasher());
+  CompactMerkleTree ctree1(&tree1, NewSha256Hasher());
   EXPECT_EQ(tree1.LeafCount(), ctree1.LeafCount());
   EXPECT_EQ(tree1.LevelCount(), ctree1.LevelCount());
   EXPECT_EQ(tree1.CurrentRoot(), ctree1.CurrentRoot());
 }
 
 TEST_F(CompactMerkleTreeTest, TestCopyCtorThenAddLeafWithRootTestVectors) {
-  MerkleTree tree(new Sha256Hasher());
+  MerkleTree tree(NewSha256Hasher());
   EXPECT_EQ(tree.LeafCount(), 0U);
   EXPECT_EQ(tree.LevelCount(), 0U);
   EXPECT_STREQ(H(tree.CurrentRoot()).c_str(), kSHA256EmptyTreeHash.str);
@@ -398,7 +403,7 @@ TEST_F(CompactMerkleTreeTest, TestCopyCtorThenAddLeafWithRootTestVectors) {
   EXPECT_EQ(tree.LeafCount(), 5U);
   EXPECT_EQ(tree.LevelCount(), kLevelCounts[4]);
   EXPECT_STREQ(H(tree.CurrentRoot()).c_str(), kSHA256Roots[4].str);
-  CompactMerkleTree ctree(tree, new Sha256Hasher());
+  CompactMerkleTree ctree(&tree, NewSha256Hasher());
   EXPECT_EQ(tree.LeafCount(), ctree.LeafCount());
   EXPECT_EQ(tree.LevelCount(), ctree.LevelCount());
   EXPECT_EQ(tree.CurrentRoot(), ctree.CurrentRoot());
@@ -419,14 +424,14 @@ TEST_F(CompactMerkleTreeTest, TestCopyCtorThenAddLeafWithRootTestVectors) {
 TEST_F(CompactMerkleTreeFuzzTest, CopyCtorForLargerTreesThenAppend) {
   for (size_t tree_size = 1; tree_size <= 512; ++tree_size) {
     // Build a tree of |tree_size| from random leaves
-    MerkleTree tree(new Sha256Hasher());
+    MerkleTree tree(NewSha256Hasher());
     for (size_t i = 0; i < tree_size; ++i) {
       const string l(RandomLeaf(256));
       tree.AddLeaf(l);
     }
     EXPECT_EQ(tree.LeafCount(), tree_size);
     // Now build a CompactMerkleTree using |tree| as the model
-    CompactMerkleTree ctree(tree, new Sha256Hasher());
+    CompactMerkleTree ctree(&tree, NewSha256Hasher());
     // And check that the public interface concurs
     EXPECT_EQ(tree.LeafCount(), ctree.LeafCount());
     EXPECT_EQ(tree.LevelCount(), ctree.LevelCount());
@@ -486,7 +491,7 @@ const PathTestVector kSHA256Paths[6] = {
 
 TEST_F(MerkleTreeTest, PathTestVectors) {
   // First tree: build in one go.
-  MerkleTree tree1(new Sha256Hasher());
+  MerkleTree tree1(NewSha256Hasher());
   for (int i = 0; i < 8; ++i) {
     tree1.AddLeaf(S(kInputs[i]));
   }
@@ -505,7 +510,7 @@ TEST_F(MerkleTreeTest, PathTestVectors) {
   }
 
   // Second tree: build incrementally.
-  MerkleTree tree2(new Sha256Hasher());
+  MerkleTree tree2(NewSha256Hasher());
   EXPECT_EQ(tree2.PathToCurrentRoot(0), tree1.PathToRootAtSnapshot(0, 0));
   EXPECT_TRUE(tree2.PathToCurrentRoot(1).empty());
   for (int i = 0; i < 8; ++i) {
@@ -551,7 +556,7 @@ const ProofTestVector kSHA256Proofs[4] = {
       {"", 0}}}};
 
 TEST_F(MerkleTreeTest, ConsistencyTestVectors) {
-  MerkleTree tree1(new Sha256Hasher());
+  MerkleTree tree1(NewSha256Hasher());
   for (int i = 0; i < 8; ++i) {
     tree1.AddLeaf(S(kInputs[i]));
   }
@@ -571,10 +576,16 @@ TEST_F(MerkleTreeTest, ConsistencyTestVectors) {
 
 TEST_F(MerkleTreeTest, AddLeafHash) {
   const char* kHashValue = "0123456789abcdef0123456789abcdef";
-  MerkleTree tree(new Sha256Hasher());
+  MerkleTree tree(NewSha256Hasher());
   size_t index = tree.AddLeafHash(kHashValue);
   EXPECT_EQ(1U, index);
   EXPECT_EQ(kHashValue, tree.LeafHash(index));
+}
+
+TEST_F(CompactMerkleTreeTest, TestCloneEmptyTreeProducesWorkingTree) {
+  MerkleTree tree(NewSha256Hasher());
+  CompactMerkleTree compact(&tree, NewSha256Hasher());
+  EXPECT_STREQ(H(compact.CurrentRoot()).c_str(), kSHA256EmptyTreeHash.str);
 }
 
 // VERIFICATION TESTS
@@ -582,7 +593,9 @@ TEST_F(MerkleTreeTest, AddLeafHash) {
 class MerkleVerifierTest : public MerkleTreeTest {
  protected:
   MerkleVerifier verifier_;
-  MerkleVerifierTest() : MerkleTreeTest(), verifier_(new Sha256Hasher()) {
+  MerkleVerifierTest()
+      : MerkleTreeTest(),
+        verifier_(unique_ptr<Sha256Hasher>(new Sha256Hasher)) {
   }
 
   void VerifierCheck(int leaf, int tree_size, const std::vector<string>& path,

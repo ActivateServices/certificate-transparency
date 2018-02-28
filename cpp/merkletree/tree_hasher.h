@@ -1,9 +1,9 @@
-#ifndef TREEHASHER_H
-#define TREEHASHER_H
+#ifndef CERT_TRANS_MERKLETREE_TREE_HASHER_H_
+#define CERT_TRANS_MERKLETREE_TREE_HASHER_H_
 
+#include <stddef.h>
 #include <memory>
 #include <mutex>
-#include <stddef.h>
 #include <string>
 
 #include "base/macros.h"
@@ -11,8 +11,7 @@
 
 class TreeHasher {
  public:
-  // Takes ownership of the SerialHasher.
-  TreeHasher(SerialHasher* hasher);
+  TreeHasher(std::unique_ptr<SerialHasher> hasher);
 
   size_t DigestSize() const {
     return hasher_->DigestSize();
@@ -38,4 +37,5 @@ class TreeHasher {
 
   DISALLOW_COPY_AND_ASSIGN(TreeHasher);
 };
-#endif
+
+#endif  // CERT_TRANS_MERKLETREE_TREE_HASHER_H_

@@ -1,7 +1,8 @@
-#ifndef MERKLEVERIFIER_H
-#define MERKLEVERIFIER_H
+#ifndef CERT_TRANS_MERKLETREE_MERKLE_VERIFIER_H_
+#define CERT_TRANS_MERKLETREE_MERKLE_VERIFIER_H_
 
 #include <stddef.h>
+#include <memory>
 #include <vector>
 
 #include "merkletree/tree_hasher.h"
@@ -13,8 +14,7 @@ class SerialHasher;
 
 class MerkleVerifier {
  public:
-  // Takes ownership of the SerialHasher.
-  MerkleVerifier(SerialHasher* hasher);
+  MerkleVerifier(std::unique_ptr<SerialHasher> hasher);
   ~MerkleVerifier();
 
   // Verify Merkle path. Return true iff the path is a valid proof for
@@ -54,4 +54,4 @@ class MerkleVerifier {
   TreeHasher treehasher_;
 };
 
-#endif
+#endif  // CERT_TRANS_MERKLETREE_MERKLE_VERIFIER_H_

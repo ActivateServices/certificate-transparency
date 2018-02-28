@@ -1,85 +1,82 @@
 /* -*- indent-tabs-mode: nil -*- */
 
-#include <event2/thread.h>
-#include <functional>
 #include <gflags/gflags.h>
-#include <iostream>
-#include <memory>
 #include <openssl/err.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <iostream>
 #include <string>
 
+#include "config.h"
 #include "log/cert_checker.h"
 #include "log/cert_submission_handler.h"
-#include "log/ct_extensions.h"
-#include "log/file_db.h"
-#include "log/file_storage.h"
+#include "log/cluster_state_controller.h"
+#include "log/etcd_consistent_store.h"
 #include "log/frontend.h"
 #include "log/frontend_signer.h"
 #include "log/log_lookup.h"
 #include "log/log_signer.h"
-#include "log/sqlite_db.h"
+#include "log/log_verifier.h"
+#include "log/strict_consistent_store.h"
 #include "log/tree_signer.h"
-#include "server/handler.h"
+#include "merkletree/merkle_verifier.h"
+#include "proto/cert_serializer.h"
+#include "server/certificate_handler.h"
+#include "server/log_processes.h"
+#include "server/server.h"
+#include "server/server_helper.h"
+#include "server/staleness_tracker.h"
+#include "util/etcd.h"
+#include "util/init.h"
 #include "util/libevent_wrapper.h"
-#include "util/read_private_key.h"
-#include "util/thread_pool.h"
+#include "util/read_key.h"
+#include "util/status.h"
+#include "util/uuid.h"
 
-DEFINE_string(server, "localhost", "Server host");
-DEFINE_int32(port, 9999, "Server port");
 DEFINE_string(key, "", "PEM-encoded server private key file");
 DEFINE_string(trusted_cert_file, "",
               "File for trusted CA certificates, in concatenated PEM format");
-DEFINE_string(cert_dir, "", "Storage directory for certificates");
-DEFINE_string(tree_dir, "", "Storage directory for trees");
-DEFINE_string(sqlite_db, "", "Database for certificate and tree storage");
-// TODO(ekasper): sanity-check these against the directory structure.
-DEFINE_int32(cert_storage_depth, 0,
-             "Subdirectory depth for certificates; if the directory is not "
-             "empty, must match the existing depth.");
-DEFINE_int32(tree_storage_depth, 0,
-             "Subdirectory depth for tree signatures; if the directory is not "
-             "empty, must match the existing depth");
-DEFINE_int32(log_stats_frequency_seconds, 3600,
-             "Interval for logging summary statistics. Approximate: the "
-             "server will log statistics if in the beginning of its select "
-             "loop, at least this period has elapsed since the last log time. "
-             "Must be greater than 0.");
-DEFINE_int32(tree_signing_frequency_seconds, 600,
-             "How often should we issue a new signed tree head. Approximate: "
-             "the signer process will kick off if in the beginning of the "
-             "server select loop, at least this period has elapsed since the "
-             "last signing. Set this well below the MMD to ensure we sign in "
-             "a timely manner. Must be greater than 0.");
+DEFINE_double(guard_window_seconds, 60,
+              "Unsequenced entries newer than this "
+              "number of seconds will not be sequenced.");
+DEFINE_int32(num_http_server_threads, 16,
+             "Number of threads for servicing the incoming HTTP requests.");
 
 namespace libevent = cert_trans::libevent;
 
 using cert_trans::CertChecker;
-using cert_trans::HttpHandler;
-using cert_trans::LoggedCertificate;
+using cert_trans::CertificateHttpHandler;
+using cert_trans::CleanUpEntries;
+using cert_trans::ClusterStateController;
+using cert_trans::ConsistentStore;
+using cert_trans::Database;
+using cert_trans::EtcdClient;
+using cert_trans::EtcdConsistentStore;
+using cert_trans::LoggedEntry;
+using cert_trans::ReadPrivateKey;
+using cert_trans::SequenceEntries;
+using cert_trans::Server;
+using cert_trans::SignMerkleTree;
+using cert_trans::StalenessTracker;
 using cert_trans::ThreadPool;
-using cert_trans::util::ReadPrivateKey;
+using cert_trans::TreeSigner;
+using cert_trans::UrlFetcher;
+using ct::ClusterNodeState;
+using ct::SignedTreeHead;
 using google::RegisterFlagValidator;
 using std::bind;
 using std::function;
 using std::make_shared;
 using std::shared_ptr;
 using std::string;
+using std::thread;
+using std::unique_ptr;
 
-static const int kCtimeBufSize = 26;
+
+namespace {
 
 // Basic sanity checks on flag values.
-static bool ValidatePort(const char* flagname, int port) {
-  if (port <= 0 || port > 65535) {
-    std::cout << "Port value " << port << " is invalid. " << std::endl;
-    return false;
-  }
-  return true;
-}
-
-static const bool port_dummy =
-    RegisterFlagValidator(&FLAGS_port, &ValidatePort);
-
 static bool ValidateRead(const char* flagname, const string& path) {
   if (access(path.c_str(), R_OK) != 0) {
     std::cout << "Cannot access " << flagname << " at " << path << std::endl;
@@ -93,88 +90,8 @@ static const bool key_dummy = RegisterFlagValidator(&FLAGS_key, &ValidateRead);
 static const bool cert_dummy =
     RegisterFlagValidator(&FLAGS_trusted_cert_file, &ValidateRead);
 
-static bool ValidateWrite(const char* flagname, const string& path) {
-  if (path != "" && access(path.c_str(), W_OK) != 0) {
-    std::cout << "Cannot modify " << flagname << " at " << path << std::endl;
-    return false;
-  }
-  return true;
-}
+}  // namespace
 
-static const bool cert_dir_dummy =
-    RegisterFlagValidator(&FLAGS_cert_dir, &ValidateWrite);
-
-static const bool tree_dir_dummy =
-    RegisterFlagValidator(&FLAGS_tree_dir, &ValidateWrite);
-
-static bool ValidateIsNonNegative(const char* flagname, int value) {
-  if (value < 0) {
-    std::cout << flagname << " must not be negative" << std::endl;
-    return false;
-  }
-  return true;
-}
-
-static const bool c_st_dummy =
-    RegisterFlagValidator(&FLAGS_cert_storage_depth, &ValidateIsNonNegative);
-static const bool t_st_dummy =
-    RegisterFlagValidator(&FLAGS_tree_storage_depth, &ValidateIsNonNegative);
-
-static bool ValidateIsPositive(const char* flagname, int value) {
-  if (value <= 0) {
-    std::cout << flagname << " must be greater than 0" << std::endl;
-    return false;
-  }
-  return true;
-}
-
-static const bool stats_dummy =
-    RegisterFlagValidator(&FLAGS_log_stats_frequency_seconds,
-                          &ValidateIsPositive);
-
-static const bool sign_dummy =
-    RegisterFlagValidator(&FLAGS_tree_signing_frequency_seconds,
-                          &ValidateIsPositive);
-
-// Hooks a repeating timer on the event loop to call a callback. It
-// will wait "interval_secs" between calls to "callback" (so this
-// means that if "callback" takes some time, it will run less
-// frequently).
-class PeriodicCallback {
- public:
-  PeriodicCallback(const shared_ptr<libevent::Base>& base, int interval_secs,
-                   const function<void()>& callback)
-      : base_(base),
-        interval_secs_(interval_secs),
-        event_(*base_, -1, 0, bind(&PeriodicCallback::Go, this)),
-        callback_(callback) {
-    event_.Add(interval_secs_);
-  }
-
- private:
-  void Go() {
-    callback_();
-    event_.Add(interval_secs_);
-  }
-
-  const shared_ptr<libevent::Base> base_;
-  const int interval_secs_;
-  libevent::Event event_;
-  const function<void()> callback_;
-
-  DISALLOW_COPY_AND_ASSIGN(PeriodicCallback);
-};
-
-void SignMerkleTree(TreeSigner<LoggedCertificate>* tree_signer,
-                    LogLookup<LoggedCertificate>* log_lookup) {
-  CHECK_EQ(tree_signer->UpdateTree(), TreeSigner<LoggedCertificate>::OK);
-  CHECK_EQ(log_lookup->Update(), LogLookup<LoggedCertificate>::UPDATE_OK);
-
-  const time_t last_update(
-      static_cast<time_t>(tree_signer->LastUpdateTime() / 1000));
-  char buf[kCtimeBufSize];
-  LOG(INFO) << "Tree successfully updated at " << ctime_r(&last_update, buf);
-}
 
 int main(int argc, char* argv[]) {
   // Ignore various signals whilst we start up.
@@ -182,74 +99,118 @@ int main(int argc, char* argv[]) {
   signal(SIGINT, SIG_IGN);
   signal(SIGTERM, SIG_IGN);
 
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  google::InitGoogleLogging(argv[0]);
-  google::InstallFailureSignalHandler();
-  OpenSSL_add_all_algorithms();
-  ERR_load_crypto_strings();
-  cert_trans::LoadCtExtensions();
+  ConfigureSerializerForV1CT();
+  util::InitCT(&argc, &argv);
 
-  EVP_PKEY* pkey = NULL;
-  CHECK_EQ(ReadPrivateKey(&pkey, FLAGS_key), cert_trans::util::KEY_OK);
-  LogSigner log_signer(pkey);
+  Server::StaticInit();
+
+  util::StatusOr<EVP_PKEY*> pkey(ReadPrivateKey(FLAGS_key));
+  CHECK_EQ(pkey.status(), ::util::OkStatus());
+  LogSigner log_signer(pkey.ValueOrDie());
 
   CertChecker checker;
   CHECK(checker.LoadTrustedCertificates(FLAGS_trusted_cert_file))
       << "Could not load CA certs from " << FLAGS_trusted_cert_file;
 
-  if (FLAGS_sqlite_db == "")
-    CHECK_NE(FLAGS_cert_dir, FLAGS_tree_dir)
-        << "Certificate directory and tree directory must differ";
+  cert_trans::EnsureValidatorsRegistered();
+  const unique_ptr<Database> db(cert_trans::ProvideDatabase());
+  CHECK(db) << "No database instance created, check flag settings";
 
-  if ((FLAGS_cert_dir != "" || FLAGS_tree_dir != "") &&
-      FLAGS_sqlite_db != "") {
-    std::cerr << "Choose either file or sqlite database, not both"
-              << std::endl;
-    exit(1);
+  shared_ptr<libevent::Base> event_base(make_shared<libevent::Base>());
+  ThreadPool internal_pool(8);
+  UrlFetcher url_fetcher(event_base.get(), &internal_pool);
+
+  const bool stand_alone_mode(cert_trans::IsStandalone(true));
+  LOG(INFO) << "Running in "
+            << (stand_alone_mode ? "STAND-ALONE" : "CLUSTERED") << " mode.";
+
+  unique_ptr<EtcdClient> etcd_client(
+      cert_trans::ProvideEtcdClient(event_base.get(), &internal_pool,
+                                    &url_fetcher));
+
+  const LogVerifier log_verifier(new LogSigVerifier(pkey.ValueOrDie()),
+                                 new MerkleVerifier(unique_ptr<Sha256Hasher>(
+                                     new Sha256Hasher)));
+
+  ThreadPool http_pool(FLAGS_num_http_server_threads);
+
+  Server server(event_base, &internal_pool, &http_pool, db.get(),
+                etcd_client.get(), &url_fetcher, &log_verifier);
+  server.Initialise(false /* is_mirror */);
+
+  Frontend frontend(
+      new FrontendSigner(db.get(), server.consistent_store(), &log_signer));
+  unique_ptr<StalenessTracker> staleness_tracker(
+      new StalenessTracker(server.cluster_state_controller(), &internal_pool,
+                           event_base.get()));
+  CertificateHttpHandler handler(server.log_lookup(), db.get(),
+                                 server.cluster_state_controller(), &checker,
+                                 &frontend, &internal_pool, event_base.get(),
+                                 staleness_tracker.get());
+
+  // Connect the handler, proxy and server together
+  handler.SetProxy(server.proxy());
+  handler.Add(server.http_server());
+
+  TreeSigner tree_signer(
+      std::chrono::duration<double>(FLAGS_guard_window_seconds), db.get(),
+      server.log_lookup()->GetCompactMerkleTree(new Sha256Hasher),
+      server.consistent_store(), &log_signer);
+
+  if (stand_alone_mode) {
+    // Set up a simple single-node environment.
+    //
+    // Put a sensible single-node config into FakeEtcd. For a real clustered
+    // log
+    // we'd expect a ClusterConfig already to be present within etcd as part of
+    // the provisioning of the log.
+    //
+    // TODO(alcutter): Note that we're currently broken wrt to restarting the
+    // log server when there's data in the log.  It's a temporary thing though,
+    // so fear ye not.
+    ct::ClusterConfig config;
+    config.set_minimum_serving_nodes(1);
+    config.set_minimum_serving_fraction(1);
+    LOG(INFO) << "Setting default single-node ClusterConfig:\n"
+              << config.DebugString();
+    server.consistent_store()->SetClusterConfig(config);
+
+    // Since we're a single node cluster, we'll settle that we're the
+    // master here, so that we can populate the initial STH
+    // (StrictConsistentStore won't allow us to do so unless we're master.)
+    server.election()->StartElection();
+    server.election()->WaitToBecomeMaster();
+
+    {
+      EtcdClient::Response resp;
+      util::SyncTask task(event_base.get());
+      etcd_client->Create("/root/sequence_mapping", "", &resp, task.task());
+      task.Wait();
+      CHECK_EQ(::util::OkStatus(), task.status());
+    }
+
+    // Do an initial signing run to get the initial STH, again this is
+    // temporary until we re-populate FakeEtcd from the DB.
+    CHECK_EQ(tree_signer.UpdateTree(), TreeSigner::OK);
+
+    // Need to boot-strap the Serving STH too because we consider it an error
+    // if it's not set, which in turn causes us to not attempt to become
+    // master:
+    server.consistent_store()->SetServingSTH(tree_signer.LatestSTH());
   }
 
-  Database<LoggedCertificate>* db;
+  server.WaitForReplication();
 
-  if (FLAGS_sqlite_db != "")
-    db = new SQLiteDB<LoggedCertificate>(FLAGS_sqlite_db);
-  else
-    db = new FileDB<LoggedCertificate>(
-        new FileStorage(FLAGS_cert_dir, FLAGS_cert_storage_depth),
-        new FileStorage(FLAGS_tree_dir, FLAGS_tree_storage_depth));
+  // TODO(pphaneuf): We should be remaining in an "unhealthy state"
+  // (either not accepting any requests, or returning some internal
+  // server error) until we have an STH to serve.
+  const function<bool()> is_master(bind(&Server::IsMaster, &server));
+  thread sequencer(&SequenceEntries, &tree_signer, is_master);
+  thread cleanup(&CleanUpEntries, server.consistent_store(), is_master);
+  thread signer(&SignMerkleTree, &tree_signer, server.consistent_store(),
+                server.cluster_state_controller());
 
-  evthread_use_pthreads();
-  const shared_ptr<libevent::Base> event_base(make_shared<libevent::Base>());
-
-  Frontend frontend(new CertSubmissionHandler(&checker),
-                    new FrontendSigner(db, &log_signer));
-  TreeSigner<LoggedCertificate> tree_signer(db, &log_signer);
-  LogLookup<LoggedCertificate> log_lookup(db);
-
-  // This function is called "sign", but it also loads the LogLookup
-  // object from the database as a side-effect.
-  SignMerkleTree(&tree_signer, &log_lookup);
-
-  const time_t last_update(
-      static_cast<time_t>(tree_signer.LastUpdateTime() / 1000));
-  if (last_update > 0) {
-    char buf[kCtimeBufSize];
-    LOG(INFO) << "Last tree update was at " << ctime_r(&last_update, buf);
-  }
-
-  ThreadPool pool;
-  HttpHandler handler(&log_lookup, db, &checker, &frontend, &pool);
-
-  PeriodicCallback tree_event(event_base, FLAGS_tree_signing_frequency_seconds,
-                              bind(&SignMerkleTree, &tree_signer,
-                                   &log_lookup));
-
-  libevent::HttpServer server(*event_base);
-  handler.Add(&server);
-  server.Bind(NULL, FLAGS_port);
-
-  std::cout << "READY" << std::endl;
-
-  event_base->Dispatch();
+  server.Run();
 
   return 0;
 }

@@ -13,20 +13,28 @@
 #include "merkletree/serial_hasher.h"
 #include "proto/serializer.h"
 
-using cert_trans::Cert;
-using cert_trans::CertChain;
+using cert_trans::serialization::DeserializeResult;
 using ct::LogEntry;
 using ct::SSLClientCTData;
 using ct::SignedCertificateTimestamp;
 using ct::SignedCertificateTimestampList;
 using std::string;
+using std::unique_ptr;
+using util::StatusOr;
+using util::error::Code;
+
+namespace cert_trans {
+namespace {
 
 const uint16_t CT_EXTENSION_TYPE = 18;
 
+} // namespace
+
+
 // static
-int SSLClient::ExtensionCallback(SSL* s, unsigned ext_type,
-                                 const unsigned char* in, size_t inlen,
-                                 int* al, void* arg) {
+int SSLClient::ExtensionCallback(SSL*, unsigned ext_type,
+                                 const unsigned char* in, size_t inlen, int*,
+                                 void* arg) {
   char pem_name[100];
   unsigned char ext_buf[4 + 65536];
 
@@ -59,32 +67,30 @@ int SSLClient::ExtensionCallback(SSL* s, unsigned ext_type,
 }
 
 // TODO(ekasper): handle Cert::Status errors.
-SSLClient::SSLClient(const string& server, uint16_t port, const string& ca_dir,
-                     LogVerifier* verifier)
+SSLClient::SSLClient(const string& server, const string& port,
+                     const string& ca_dir, LogVerifier* verifier)
     : client_(server, port),
-      ctx_(NULL),
-      ssl_(NULL),
+      ctx_(CHECK_NOTNULL(SSL_CTX_new(TLSv1_client_method()))),
       verify_args_(verifier),
       connected_(false) {
-  ctx_ = SSL_CTX_new(TLSv1_client_method());
-  CHECK_NOTNULL(ctx_);
-
   // SSL_VERIFY_PEER makes the connection abort immediately
   // if verification fails.
-  SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, NULL);
+  SSL_CTX_set_verify(ctx_.get(), SSL_VERIFY_PEER, NULL);
   // Set trusted CA certs.
   if (!ca_dir.empty()) {
-    CHECK_EQ(1, SSL_CTX_load_verify_locations(ctx_, NULL, ca_dir.c_str()))
+    CHECK_EQ(1,
+             SSL_CTX_load_verify_locations(ctx_.get(), NULL, ca_dir.c_str()))
         << "Unable to load trusted CA certificates.";
   } else {
-    LOG(WARNING) << "No trusted CA certificates given.";
+    SSL_CTX_set_default_verify_paths(ctx_.get());
+    LOG(INFO) << "Using system trusted CA certificates.";
   }
 
-  SSL_CTX_set_cert_verify_callback(ctx_, &VerifyCallback, &verify_args_);
+  SSL_CTX_set_cert_verify_callback(ctx_.get(), &VerifyCallback, &verify_args_);
 
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
-  SSL_CTX_add_client_custom_ext(ctx_, CT_EXTENSION_TYPE, NULL, NULL, NULL,
-                                ExtensionCallback, &verify_args_);
+  SSL_CTX_add_client_custom_ext(ctx_.get(), CT_EXTENSION_TYPE, NULL, NULL,
+                                NULL, ExtensionCallback, &verify_args_);
 #else
   LOG(WARNING) << "OpenSSL version is too low to check the Certificate "
                   "Transparency TLS extension";
@@ -93,9 +99,6 @@ SSLClient::SSLClient(const string& server, uint16_t port, const string& ca_dir,
 
 SSLClient::~SSLClient() {
   Disconnect();
-  if (ctx_ != NULL)
-    SSL_CTX_free(ctx_);
-  delete verify_args_.verifier;
 }
 
 bool SSLClient::Connected() const {
@@ -103,11 +106,10 @@ bool SSLClient::Connected() const {
 }
 
 void SSLClient::Disconnect() {
-  if (ssl_ != NULL) {
-    SSL_shutdown(ssl_);
-    SSL_free(ssl_);
-    ssl_ = NULL;
+  if (ssl_) {
+    SSL_shutdown(ssl_.get());
     LOG(INFO) << "SSL session finished";
+    ssl_.reset();
   }
   client_.Disconnect();
   connected_ = false;
@@ -125,18 +127,18 @@ void SSLClient::GetSSLClientCTData(SSLClientCTData* data) const {
 // proof is re-submitted (or submitted to another log) and the server attaches
 // that proof too, but let's not complicate things for now.
 // static
-LogVerifier::VerifyResult SSLClient::VerifySCT(const string& token,
-                                               LogVerifier* verifier,
-                                               SSLClientCTData* data) {
+LogVerifier::LogVerifyResult SSLClient::VerifySCT(const string& token,
+                                                  LogVerifier* verifier,
+                                                  SSLClientCTData* data) {
   CHECK(data->has_reconstructed_entry());
   SignedCertificateTimestamp local_sct;
   // Skip over bad SCTs. These could be either badly encoded ones, or
   // SCTs whose version we don't understand.
-  if (Deserializer::DeserializeSCT(token, &local_sct) != Deserializer::OK)
+  if (Deserializer::DeserializeSCT(token, &local_sct) != DeserializeResult::OK)
     return LogVerifier::INVALID_FORMAT;
 
   string merkle_leaf;
-  LogVerifier::VerifyResult result =
+  LogVerifier::LogVerifyResult result =
       verifier->VerifySignedCertificateTimestamp(data->reconstructed_entry(),
                                                  local_sct, &merkle_leaf);
   if (result != LogVerifier::VERIFY_OK)
@@ -151,12 +153,14 @@ LogVerifier::VerifyResult SSLClient::VerifySCT(const string& token,
 int SSLClient::VerifyCallback(X509_STORE_CTX* ctx, void* arg) {
   VerifyCallbackArgs* args = reinterpret_cast<VerifyCallbackArgs*>(arg);
   CHECK_NOTNULL(args);
-  LogVerifier* verifier = args->verifier;
+  LogVerifier* verifier(args->verifier.get());
   CHECK_NOTNULL(verifier);
 
   int vfy = X509_verify_cert(ctx);
   if (vfy != 1) {
-    LOG(ERROR) << "Certificate verification failed.";
+    int error = X509_STORE_CTX_get_error(ctx);
+    LOG(ERROR) << "Certificate verification failed: "
+               << X509_verify_cert_error_string(error);
     return vfy;
   }
 
@@ -170,43 +174,56 @@ int SSLClient::VerifyCallback(X509_STORE_CTX* ctx, void* arg) {
   int chain_size = sk_X509_num(ctx->chain);
   // Should contain at least the leaf.
   CHECK_GE(chain_size, 1);
-  for (int i = 0; i < chain_size; ++i)
-    chain.AddCert(new Cert(X509_dup(sk_X509_value(ctx->chain, i))));
+  for (int i = 0; i < chain_size; ++i) {
+    chain.AddCert(
+        Cert::FromX509(ScopedX509(X509_dup(sk_X509_value(ctx->chain, i)))));
+  }
 
   CHECK_NOTNULL(ctx->untrusted);
   chain_size = sk_X509_num(ctx->untrusted);
   // Should contain at least the leaf.
   CHECK_GE(chain_size, 1);
-  for (int i = 0; i < chain_size; ++i)
-    input_chain.AddCert(new Cert(X509_dup(sk_X509_value(ctx->untrusted, i))));
+  for (int i = 0; i < chain_size; ++i) {
+    input_chain.AddCert(Cert::FromX509(
+        ScopedX509(X509_dup(sk_X509_value(ctx->untrusted, i)))));
+  }
 
   string serialized_scts;
   // First, see if the cert has an embedded proof.
-  if (chain.LeafCert()->HasExtension(
-          cert_trans::NID_ctEmbeddedSignedCertificateTimestampList) ==
-      Cert::TRUE) {
+  const StatusOr<bool> has_embedded_proof = chain.LeafCert()->HasExtension(
+      cert_trans::NID_ctEmbeddedSignedCertificateTimestampList);
+
+  // Pull out the superfluous cert extension if it exists for use later
+  // Let's assume the superfluous cert is always last in the chain.
+  const StatusOr<bool> superf_has_timestamp_list =
+      input_chain.Length() > 1
+          ? input_chain.LastCert()->HasExtension(
+                cert_trans::NID_ctSignedCertificateTimestampList)
+          : util::Status::UNKNOWN;
+
+  // First check for embedded proof, if not present then look for the proof in
+  // a superfluous cert.
+  if (has_embedded_proof.ok() && has_embedded_proof.ValueOrDie()) {
     LOG(INFO) << "Embedded proof extension found in certificate, "
               << "verifying...";
-    Cert::Status status = chain.LeafCert()->OctetStringExtensionData(
+    util::Status status = chain.LeafCert()->OctetStringExtensionData(
         cert_trans::NID_ctEmbeddedSignedCertificateTimestampList,
         &serialized_scts);
-    if (status != Cert::TRUE) {
-      // Any error here is likely OpenSSL acting up, so just die.
-      CHECK_EQ(Cert::FALSE, status);
+    if (!status.ok()) {
+      // Any error here is likely OpenSSL acting up, so just die. Previously
+      // was CHECK_EQ(FALSE..., which meant fail check if not an error and not
+      // false
+      CHECK_EQ(Code::NOT_FOUND, status.CanonicalCode());
       LOG(ERROR) << "Failed to parse extension data: corrupt cert?";
     }
-    // Else look for the proof in a superfluous cert.
-    // Let's assume the superfluous cert is always last in the chain.
-  } else if (input_chain.Length() > 1 &&
-             input_chain.LastCert()->HasExtension(
-                 cert_trans::NID_ctSignedCertificateTimestampList) ==
-                 Cert::TRUE) {
+  } else if (superf_has_timestamp_list.ok() &&
+             superf_has_timestamp_list.ValueOrDie()) {
     LOG(INFO) << "Proof extension found in certificate, verifying...";
-    Cert::Status status = input_chain.LastCert()->OctetStringExtensionData(
+    util::Status status = input_chain.LastCert()->OctetStringExtensionData(
         cert_trans::NID_ctSignedCertificateTimestampList, &serialized_scts);
-    if (status != Cert::TRUE) {
+    if (!status.ok()) {
       // Any error here is likely OpenSSL acting up, so just die.
-      CHECK_EQ(Cert::FALSE, status);
+      CHECK_EQ(Code::NOT_FOUND, status.CanonicalCode());
       LOG(ERROR) << "Failed to parse extension data: corrupt cert?";
     }
   }
@@ -222,18 +239,18 @@ int SSLClient::VerifyCallback(X509_STORE_CTX* ctx, void* arg) {
     } else {
       args->ct_data.mutable_reconstructed_entry()->CopyFrom(entry);
       args->ct_data.set_certificate_sha256_hash(
-          Sha256Hasher::Sha256Digest(Serializer::LeafCertificate(entry)));
+          Sha256Hasher::Sha256Digest(Serializer::LeafData(entry)));
       // Only writes the checkpoint if verification succeeds.
       // Note: an optimized client could only verify the signature if it's
       // a certificate it hasn't seen before.
       SignedCertificateTimestampList sct_list;
       if (Deserializer::DeserializeSCTList(serialized_scts, &sct_list) !=
-          Deserializer::OK) {
+          DeserializeResult::OK) {
         LOG(ERROR) << "Failed to parse SCT list.";
       } else {
         LOG(INFO) << "Received " << sct_list.sct_list_size() << " SCTs";
         for (int i = 0; i < sct_list.sct_list_size(); ++i) {
-          LogVerifier::VerifyResult result =
+          LogVerifier::LogVerifyResult result =
               VerifySCT(sct_list.sct_list(i), verifier, &args->ct_data);
 
           if (result == LogVerifier::VERIFY_OK) {
@@ -267,15 +284,18 @@ SSLClient::HandshakeResult SSLClient::SSLConnect(bool strict) {
   if (!client_.Connect())
     return SERVER_UNAVAILABLE;
 
-  ssl_ = SSL_new(ctx_);
-  CHECK_NOTNULL(ssl_);
-  BIO* bio = BIO_new_socket(client_.fd(), BIO_NOCLOSE);
-  CHECK_NOTNULL(bio);
-  // Takes ownership of bio.
-  SSL_set_bio(ssl_, bio, bio);
+  ssl_.reset(SSL_new(ctx_.get()));
+  CHECK_NOTNULL(ssl_.get());
+  ScopedBIO bio(BIO_new_socket(client_.fd(), BIO_NOCLOSE));
+  CHECK_NOTNULL(bio.get());
+  {
+    BIO* const b(bio.release());
+    // Takes ownership of bio.
+    SSL_set_bio(ssl_.get(), b, b);
+  }
 
   ResetVerifyCallbackArgs(strict);
-  int ret = SSL_connect(ssl_);
+  int ret = SSL_connect(ssl_.get());
   HandshakeResult result;
   if (ret == 1) {
     LOG(INFO) << "Handshake successful. SSL session started";
@@ -291,3 +311,6 @@ SSLClient::HandshakeResult SSLClient::SSLConnect(bool strict) {
   }
   return result;
 }
+
+
+}  // namespace cert_trans

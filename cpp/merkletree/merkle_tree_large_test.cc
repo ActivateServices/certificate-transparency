@@ -2,8 +2,8 @@
 #include <gtest/gtest.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string>
 #include <sys/resource.h>
+#include <string>
 #include <vector>
 
 #include "merkletree/merkle_tree.h"
@@ -14,6 +14,7 @@
 namespace {
 
 using std::string;
+using std::unique_ptr;
 
 class MerkleTreeLargeTest : public ::testing::Test {
  protected:
@@ -33,7 +34,8 @@ TEST_F(MerkleTreeLargeTest, BuildLargeTree) {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     long max_rss_before = ru.ru_maxrss;
-    MerkleTree* tree = new MerkleTree(new Sha256Hasher());
+    MerkleTree* tree(
+        new MerkleTree(unique_ptr<Sha256Hasher>(new Sha256Hasher)));
     trees.push_back(tree);
     uint64_t time_before = util::TimeInMilliseconds();
 

@@ -10,17 +10,19 @@
 #include <string>
 
 #include "log/log_signer.h"
-#include "log/logged_certificate.h"
+#include "log/logged_entry.h"
 #include "log/signer.h"
 #include "log/verifier.h"
 #include "merkletree/serial_hasher.h"
 #include "merkletree/tree_hasher.h"
 #include "proto/ct.pb.h"
 #include "proto/serializer.h"
+#include "util/openssl_scoped_types.h"
 #include "util/util.h"
 
+using cert_trans::LoggedEntry;
+using cert_trans::ScopedBIO;
 using cert_trans::Signer;
-using cert_trans::LoggedCertificate;
 using cert_trans::Verifier;
 using ct::DigitallySigned;
 using ct::LogEntry;
@@ -29,6 +31,7 @@ using ct::SignedCertificateTimestamp;
 using ct::SignedTreeHead;
 using ct::X509ChainEntry;
 using std::string;
+using std::unique_ptr;
 
 namespace {
 
@@ -122,7 +125,7 @@ const char kDefaultPrecertSCTSignature[] =
 // Some time in September 2012.
 const uint64_t kDefaultSTHTimestamp = 1348589667204LL;
 
-const uint64_t kDefaultTreeSize = 42;
+const int64_t kDefaultTreeSize = 42;
 
 // *Some* hash that we pretend is a valid root hash.
 const char kDefaultRootHash[] =
@@ -155,18 +158,18 @@ const char kKeyID[] =
 
 EVP_PKEY* PrivateKeyFromPem(const string& pemkey) {
   // BIO_new_mem_buf is read-only.
-  BIO* bio = BIO_new_mem_buf(const_cast<char*>(pemkey.data()), pemkey.size());
-  EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+  ScopedBIO bio(
+      BIO_new_mem_buf(const_cast<char*>(pemkey.data()), pemkey.size()));
+  EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio.get(), NULL, NULL, NULL);
   CHECK_NOTNULL(pkey);
-  BIO_free(bio);
   return pkey;
 }
 
 EVP_PKEY* PublicKeyFromPem(const string& pemkey) {
-  BIO* bio = BIO_new_mem_buf(const_cast<char*>(pemkey.data()), pemkey.size());
-  EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+  ScopedBIO bio(
+      BIO_new_mem_buf(const_cast<char*>(pemkey.data()), pemkey.size()));
+  EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio.get(), NULL, NULL, NULL);
   CHECK_NOTNULL(pkey);
-  BIO_free(bio);
   return pkey;
 }
 
@@ -176,7 +179,7 @@ TestSigner::TestSigner()
     : default_signer_(NULL),
       counter_(0),
       default_cert_(B(kDefaultDerCert)),
-      tree_hasher_(new Sha256Hasher()) {
+      tree_hasher_(unique_ptr<Sha256Hasher>(new Sha256Hasher)) {
   counter_ = util::TimeInMilliseconds();
   srand(counter_);
   EVP_PKEY* pkey = PrivateKeyFromPem(kEcP256PrivateKey);
@@ -269,7 +272,7 @@ void TestSigner::SetPrecertDefaults(SignedCertificateTimestamp* sct) {
 }
 
 // static
-void TestSigner::SetDefaults(LoggedCertificate* logged_cert) {
+void TestSigner::SetDefaults(LoggedEntry* logged_cert) {
   // Some time in September 2012.
   SetDefaults(logged_cert->mutable_sct());
   SetDefaults(logged_cert->mutable_entry());
@@ -352,15 +355,16 @@ void TestSigner::CreateUnique(LogEntry* entry) {
   }
 }
 
-void TestSigner::CreateUnique(LoggedCertificate* logged_cert) {
+void TestSigner::CreateUnique(LoggedEntry* logged_cert) {
   FillData(logged_cert);
+  logged_cert->set_sequence_number(rand());
 
   CHECK_EQ(LogSigner::OK,
            default_signer_->SignCertificateTimestamp(
                logged_cert->entry(), logged_cert->mutable_sct()));
 }
 
-void TestSigner::CreateUniqueFakeSignature(LoggedCertificate* logged_cert) {
+void TestSigner::CreateUniqueFakeSignature(LoggedEntry* logged_cert) {
   FillData(logged_cert);
 
   logged_cert->mutable_sct()->mutable_signature()->set_hash_algorithm(
@@ -432,8 +436,8 @@ void TestSigner::TestEqualSCTs(const SignedCertificateTimestamp& sct0,
 }
 
 // static
-void TestSigner::TestEqualLoggedCerts(const LoggedCertificate& c0,
-                                      const LoggedCertificate& c1) {
+void TestSigner::TestEqualLoggedCerts(const LoggedEntry& c0,
+                                      const LoggedEntry& c1) {
   TestEqualEntries(c0.entry(), c1.entry());
   TestEqualSCTs(c0.sct(), c1.sct());
 
@@ -454,7 +458,7 @@ void TestSigner::TestEqualTreeHeads(const SignedTreeHead& sth0,
   TestEqualDigitallySigned(sth0.signature(), sth1.signature());
 }
 
-void TestSigner::FillData(LoggedCertificate* logged_cert) {
+void TestSigner::FillData(LoggedEntry* logged_cert) {
   logged_cert->mutable_sct()->set_version(ct::V1);
   logged_cert->mutable_sct()->mutable_id()->set_key_id(B(kKeyID));
   logged_cert->mutable_sct()->set_timestamp(util::TimeInMilliseconds());
@@ -464,9 +468,9 @@ void TestSigner::FillData(LoggedCertificate* logged_cert) {
 
   CHECK_EQ(logged_cert->Hash(),
            Sha256Hasher::Sha256Digest(
-               Serializer::LeafCertificate(logged_cert->entry())));
+               Serializer::LeafData(logged_cert->entry())));
   string serialized_leaf;
-  CHECK_EQ(Serializer::OK,
+  CHECK_EQ(cert_trans::serialization::SerializeResult::OK,
            Serializer::SerializeSCTMerkleTreeLeaf(logged_cert->sct(),
                                                   logged_cert->entry(),
                                                   &serialized_leaf));

@@ -725,6 +725,20 @@ class Integer(Simple):
     def _decode_value(cls, buf, strict=True):
         return decode_int(buf, strict=strict)
 
+@Universal(5, tag.PRIMITIVE)
+class Null(Simple):
+    """Null."""
+
+    def _encode_value(self):
+        return ""
+
+    @classmethod
+    def _convert_value(cls, value):
+        return None
+
+    @classmethod
+    def _decode_value(cls, buf, strict=True):
+        return None
 
 class ASN1String(Simple):
     """Base class for string types."""
@@ -974,6 +988,16 @@ class Any(ASN1String):
             return self._decoded_value.human_readable_lines(wrap=wrap,
                                                             label=label)
         return super(Any, self).human_readable_lines(wrap=wrap, label=label)
+
+    def modified(self):
+        if self._decoded_value is not None:
+            return self._decoded_value.modified()
+        return False
+
+    def _encode_value(self):
+        if self._decoded_value is not None and self._decoded_value.modified():
+            return self._decoded_value.encode()
+        return self._value
 
     @property
     def decoded(self):

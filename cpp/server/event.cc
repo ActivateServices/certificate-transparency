@@ -10,7 +10,7 @@ time_t Services::rough_time_;
 FD::FD(EventLoop* loop, int fd, CanDelete deletable)
     : fd_(fd), loop_(loop), wants_erase_(false), deletable_(deletable) {
   DCHECK_GE(fd, 0);
-  CHECK_LT((unsigned)fd, FD_SETSIZE);
+  CHECK_LT((unsigned)fd, (unsigned)FD_SETSIZE);
   loop->Add(this);
   Activity();
 }
@@ -183,7 +183,7 @@ bool EventLoop::EraseCheck(std::deque<FD*>::iterator* pfd) {
 // static
 void EventLoop::Set(int fd, fd_set* fdset, int* max) {
   DCHECK_GE(fd, 0);
-  CHECK_LT((unsigned)fd, FD_SETSIZE);
+  CHECK_LT((unsigned)fd, (unsigned)FD_SETSIZE);
   FD_SET(fd, fdset);
   if (fd > *max)
     *max = fd;
@@ -251,7 +251,7 @@ bool Services::InitServer(int* sock, int port, const char* ip, int type) {
   server.sin_family = AF_INET;
   server.sin_port = htons((unsigned short)port);
   if (ip == NULL)
-    server.sin_addr.s_addr = INADDR_ANY;
+    server.sin_addr.s_addr = htonl(INADDR_ANY);
   else
     memcpy(&server.sin_addr.s_addr, ip, 4);
 

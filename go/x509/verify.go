@@ -5,6 +5,7 @@
 package x509
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -117,19 +118,29 @@ func (e UnknownAuthorityError) Error() string {
 
 // SystemRootsError results when we fail to load the system root certificates.
 type SystemRootsError struct {
+	Err error
 }
 
-func (e SystemRootsError) Error() string {
-	return "x509: failed to load system roots and no roots provided"
+func (se SystemRootsError) Error() string {
+	msg := "x509: failed to load system roots and no roots provided"
+	if se.Err != nil {
+		return msg + "; " + se.Err.Error()
+	}
+	return msg
 }
+
+// errNotParsed is returned when a certificate without ASN.1 contents is
+// verified. Platform-specific verification needs the ASN.1 contents.
+var errNotParsed = errors.New("x509: missing ASN.1 contents; use ParseCertificate")
 
 // VerifyOptions contains parameters for Certificate.Verify. It's a structure
 // because other PKIX verification APIs have ended up needing many options.
 type VerifyOptions struct {
-	DNSName       string
-	Intermediates *CertPool
-	Roots         *CertPool // if nil, the system roots are used
-	CurrentTime   time.Time // if zero, the current time is used
+	DNSName           string
+	Intermediates     *CertPool
+	Roots             *CertPool // if nil, the system roots are used
+	CurrentTime       time.Time // if zero, the current time is used
+	DisableTimeChecks bool
 	// KeyUsage specifies which Extended Key Usage values are acceptable.
 	// An empty list means ExtKeyUsageServerAuth. Key usage is considered a
 	// constraint down the chain which mirrors Windows CryptoAPI behaviour,
@@ -145,12 +156,14 @@ const (
 
 // isValid performs validity checks on the c.
 func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *VerifyOptions) error {
-	now := opts.CurrentTime
-	if now.IsZero() {
-		now = time.Now()
-	}
-	if now.Before(c.NotBefore) || now.After(c.NotAfter) {
-		return CertificateInvalidError{c, Expired}
+	if !opts.DisableTimeChecks {
+		now := opts.CurrentTime
+		if now.IsZero() {
+			now = time.Now()
+		}
+		if now.Before(c.NotBefore) || now.After(c.NotAfter) {
+			return CertificateInvalidError{c, Expired}
+		}
 	}
 
 	if len(c.PermittedDNSDomains) > 0 {
@@ -175,7 +188,7 @@ func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *V
 	// being valid for encryption only, but no-one noticed. Another
 	// European CA marked its signature keys as not being valid for
 	// signatures. A different CA marked its own trusted root certificate
-	// as being invalid for certificate signing.  Another national CA
+	// as being invalid for certificate signing. Another national CA
 	// distributed a certificate to be used to encrypt data for the
 	// country’s tax authority that was marked as only being usable for
 	// digital signatures but not for encryption. Yet another CA reversed
@@ -206,17 +219,37 @@ func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *V
 // needed. If successful, it returns one or more chains where the first
 // element of the chain is c and the last element is from opts.Roots.
 //
+// If opts.Roots is nil and system roots are unavailable the returned error
+// will be of type SystemRootsError.
+//
 // WARNING: this doesn't do any revocation checking.
 func (c *Certificate) Verify(opts VerifyOptions) (chains [][]*Certificate, err error) {
+	// Platform-specific verification needs the ASN.1 contents so
+	// this makes the behaviour consistent across platforms.
+	if len(c.Raw) == 0 {
+		return nil, errNotParsed
+	}
+	if opts.Intermediates != nil {
+		for _, intermediate := range opts.Intermediates.certs {
+			if len(intermediate.Raw) == 0 {
+				return nil, errNotParsed
+			}
+		}
+	}
+
 	// Use Windows's own verification and chain building.
 	if opts.Roots == nil && runtime.GOOS == "windows" {
 		return c.systemVerify(&opts)
 	}
 
+	if len(c.UnhandledCriticalExtensions) > 0 {
+		return nil, UnhandledCriticalExtension{}
+	}
+
 	if opts.Roots == nil {
 		opts.Roots = systemRootsPool()
 		if opts.Roots == nil {
-			return nil, SystemRootsError{}
+			return nil, SystemRootsError{systemRootsErr}
 		}
 	}
 
@@ -321,6 +354,9 @@ nextIntermediate:
 }
 
 func matchHostnames(pattern, host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	pattern = strings.TrimSuffix(pattern, ".")
+
 	if len(pattern) == 0 || len(host) == 0 {
 		return false
 	}
@@ -333,7 +369,7 @@ func matchHostnames(pattern, host string) bool {
 	}
 
 	for i, patternPart := range patternParts {
-		if patternPart == "*" {
+		if i == 0 && patternPart == "*" {
 			continue
 		}
 		if patternPart != hostParts[i] {
@@ -425,6 +461,7 @@ func checkChainForKeyUsage(chain []*Certificate, keyUsages []ExtKeyUsage) bool {
 	// by each certificate. If we cross out all the usages, then the chain
 	// is unacceptable.
 
+NextCert:
 	for i := len(chain) - 1; i >= 0; i-- {
 		cert := chain[i]
 		if len(cert.ExtKeyUsage) == 0 && len(cert.UnknownExtKeyUsage) == 0 {
@@ -435,7 +472,7 @@ func checkChainForKeyUsage(chain []*Certificate, keyUsages []ExtKeyUsage) bool {
 		for _, usage := range cert.ExtKeyUsage {
 			if usage == ExtKeyUsageAny {
 				// The certificate is explicitly good for any usage.
-				continue
+				continue NextCert
 			}
 		}
 

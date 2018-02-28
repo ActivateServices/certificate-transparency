@@ -1,6 +1,6 @@
 #include "merkletree/merkle_tree.h"
 
-#include <glog/logging.h>
+#include <assert.h>
 #include <stddef.h>
 #include <string>
 #include <vector>
@@ -8,11 +8,13 @@
 #include "merkletree/merkle_tree_math.h"
 
 using cert_trans::MerkleTreeInterface;
+using std::move;
 using std::string;
+using std::unique_ptr;
 
-MerkleTree::MerkleTree(SerialHasher* hasher)
+MerkleTree::MerkleTree(unique_ptr<SerialHasher> hasher)
     : MerkleTreeInterface(),
-      treehasher_(hasher),
+      treehasher_(move(hasher)),
       leaves_processed_(0),
       level_count_(0) {
 }
@@ -110,8 +112,8 @@ string MerkleTree::UpdateToSnapshot(size_t snapshot) {
     return Node(0, 0);
   if (snapshot == leaves_processed_)
     return Root();
-  CHECK_LE(snapshot, LeafCount());
-  CHECK_GT(snapshot, leaves_processed_);
+  assert(snapshot <= LeafCount());
+  assert(snapshot > leaves_processed_);
 
   // Update tree, moving up level-by-level.
   size_t level = 0;
@@ -171,7 +173,7 @@ string MerkleTree::RecomputePastSnapshot(size_t snapshot, size_t node_level,
     return Root();
   }
 
-  CHECK_LT(snapshot, leaves_processed_);
+  assert(snapshot < leaves_processed_);
 
   // Recompute nodes on the path of the last leaf.
   while (MerkleTreeMath::IsRightChild(last_node)) {
@@ -249,34 +251,34 @@ std::vector<string> MerkleTree::PathFromNodeToRootAtSnapshot(size_t node,
 }
 
 string MerkleTree::Node(size_t level, size_t index) const {
-  CHECK_GT(NodeCount(level), index);
+  assert(NodeCount(level) > index);
   return tree_[level].substr(index * treehasher_.DigestSize(),
                              treehasher_.DigestSize());
 }
 
 string MerkleTree::Root() const {
-  CHECK_EQ(tree_.back().size(), treehasher_.DigestSize());
+  assert(tree_.back().size() == treehasher_.DigestSize());
   return tree_.back();
 }
 
 size_t MerkleTree::NodeCount(size_t level) const {
-  CHECK_GT(LazyLevelCount(), level);
+  assert(LazyLevelCount() > level);
   return tree_[level].size() / treehasher_.DigestSize();
 }
 
 string MerkleTree::LastNode(size_t level) const {
-  CHECK_GE(NodeCount(level), 1U);
+  assert(NodeCount(level) >= 1U);
   return tree_[level].substr(tree_[level].size() - treehasher_.DigestSize());
 }
 
 void MerkleTree::PopBack(size_t level) {
-  CHECK_GE(NodeCount(level), 1U);
+  assert(NodeCount(level) >= 1U);
   tree_[level].erase(tree_[level].size() - treehasher_.DigestSize());
 }
 
 void MerkleTree::PushBack(size_t level, string node) {
-  CHECK_EQ(node.size(), treehasher_.DigestSize());
-  CHECK_GT(LazyLevelCount(), level);
+  assert(node.size() == treehasher_.DigestSize());
+  assert(LazyLevelCount() > level);
   tree_[level].append(node);
 }
 

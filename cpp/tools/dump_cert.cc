@@ -1,9 +1,10 @@
-#include <fstream>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <fstream>
 #include <iostream>
 
 #include "proto/ct.pb.h"
+#include "util/init.h"
 #include "util/util.h"
 
 using std::cout;
@@ -15,7 +16,7 @@ namespace {
 
 void DumpLoggedCert(const char* filename) {
   ifstream input(filename);
-  ct::LoggedCertificatePB pb;
+  ct::LoggedEntryPB pb;
   CHECK(pb.ParseFromIstream(&input));
 
   if (pb.has_sequence_number())
@@ -26,12 +27,12 @@ void DumpLoggedCert(const char* filename) {
          << endl;
 
   if (pb.contents().has_sct())
-    cout << "--- begin sct" << endl << pb.contents().sct().DebugString()
-         << "--- end sct" << endl;
+    cout << "--- begin sct" << endl
+         << pb.contents().sct().DebugString() << "--- end sct" << endl;
 
   if (pb.contents().has_entry())
-    cout << "--- begin entry" << endl << pb.contents().entry().DebugString()
-         << "--- end entry" << endl;
+    cout << "--- begin entry" << endl
+         << pb.contents().entry().DebugString() << "--- end entry" << endl;
 }
 
 
@@ -39,8 +40,7 @@ void DumpLoggedCert(const char* filename) {
 
 
 int main(int argc, char* argv[]) {
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  google::InitGoogleLogging(argv[0]);
+  util::InitCT(&argc, &argv);
 
   for (int i = 1; i < argc; ++i)
     DumpLoggedCert(argv[i]);

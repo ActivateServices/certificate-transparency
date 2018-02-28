@@ -10,6 +10,7 @@
 #include "proto/serializer.h"
 #include "util/util.h"
 
+using cert_trans::serialization::SerializeResult;
 using ct::LogEntry;
 using ct::MerkleAuditProof;
 using ct::SignedCertificateTimestamp;
@@ -26,7 +27,7 @@ LogVerifier::~LogVerifier() {
   delete merkle_verifier_;
 }
 
-LogVerifier::VerifyResult LogVerifier::VerifySignedCertificateTimestamp(
+LogVerifier::LogVerifyResult LogVerifier::VerifySignedCertificateTimestamp(
     const LogEntry& entry, const SignedCertificateTimestamp& sct,
     uint64_t begin_range, uint64_t end_range, string* merkle_leaf_hash) const {
   if (!IsBetween(sct.timestamp(), begin_range, end_range))
@@ -38,7 +39,7 @@ LogVerifier::VerifyResult LogVerifier::VerifySignedCertificateTimestamp(
   string serialized_leaf;
   // If SCT verification succeeded, then we should never fail here.
   if (merkle_leaf_hash != NULL) {
-    CHECK_EQ(Serializer::OK,
+    CHECK_EQ(SerializeResult::OK,
              Serializer::SerializeSCTMerkleTreeLeaf(sct, entry,
                                                     &serialized_leaf));
     merkle_leaf_hash->assign(merkle_verifier_->LeafHash(serialized_leaf));
@@ -46,7 +47,7 @@ LogVerifier::VerifyResult LogVerifier::VerifySignedCertificateTimestamp(
   return VERIFY_OK;
 }
 
-LogVerifier::VerifyResult LogVerifier::VerifySignedCertificateTimestamp(
+LogVerifier::LogVerifyResult LogVerifier::VerifySignedCertificateTimestamp(
     const LogEntry& entry, const SignedCertificateTimestamp& sct,
     string* merkle_leaf_hash) const {
   // Allow a bit of slack, say 1 second into the future.
@@ -55,7 +56,7 @@ LogVerifier::VerifyResult LogVerifier::VerifySignedCertificateTimestamp(
                                           merkle_leaf_hash);
 }
 
-LogVerifier::VerifyResult LogVerifier::VerifySignedTreeHead(
+LogVerifier::LogVerifyResult LogVerifier::VerifySignedTreeHead(
     const SignedTreeHead& sth, uint64_t begin_range,
     uint64_t end_range) const {
   if (!IsBetween(sth.timestamp(), begin_range, end_range))
@@ -66,13 +67,13 @@ LogVerifier::VerifyResult LogVerifier::VerifySignedTreeHead(
   return VERIFY_OK;
 }
 
-LogVerifier::VerifyResult LogVerifier::VerifySignedTreeHead(
+LogVerifier::LogVerifyResult LogVerifier::VerifySignedTreeHead(
     const SignedTreeHead& sth) const {
   // Allow a bit of slack, say 1 second into the future.
   return VerifySignedTreeHead(sth, 0, util::TimeInMilliseconds() + 1000);
 }
 
-LogVerifier::VerifyResult LogVerifier::VerifyMerkleAuditProof(
+LogVerifier::LogVerifyResult LogVerifier::VerifyMerkleAuditProof(
     const LogEntry& entry, const SignedCertificateTimestamp& sct,
     const MerkleAuditProof& merkle_proof) const {
   if (!IsBetween(merkle_proof.timestamp(), sct.timestamp(),
@@ -80,10 +81,10 @@ LogVerifier::VerifyResult LogVerifier::VerifyMerkleAuditProof(
     return INCONSISTENT_TIMESTAMPS;
 
   string serialized_leaf;
-  Serializer::SerializeResult serialize_result =
+  SerializeResult serialize_result =
       Serializer::SerializeSCTMerkleTreeLeaf(sct, entry, &serialized_leaf);
 
-  if (serialize_result != Serializer::OK)
+  if (serialize_result != SerializeResult::OK)
     return INVALID_FORMAT;
 
   std::vector<string> path;

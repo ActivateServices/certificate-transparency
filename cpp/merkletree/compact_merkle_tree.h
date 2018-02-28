@@ -1,12 +1,13 @@
-#ifndef COMPACT_MERKLETREE_H
-#define COMPACT_MERKLETREE_H
+#ifndef CERT_TRANS_MERKLETREE_COMPACT_MERKLE_TREE_H_
+#define CERT_TRANS_MERKLETREE_COMPACT_MERKLE_TREE_H_
 
 #include <stddef.h>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "merkletree/merkle_tree_interface.h"
 #include "merkletree/merkle_tree.h"
+#include "merkletree/merkle_tree_interface.h"
 #include "merkletree/tree_hasher.h"
 
 class SerialHasher;
@@ -20,13 +21,21 @@ class CompactMerkleTree : public cert_trans::MerkleTreeInterface {
  public:
   // The constructor takes a pointer to some concrete hash function
   // instantiation of the SerialHasher abstract class.
-  // Takes ownership of the hasher.
-  explicit CompactMerkleTree(SerialHasher* hasher);
+  explicit CompactMerkleTree(std::unique_ptr<SerialHasher> hasher);
+  CompactMerkleTree(const CompactMerkleTree& other,
+                    std::unique_ptr<SerialHasher> hasher);
+
+  explicit CompactMerkleTree(CompactMerkleTree&& other) = default;
 
   // Creates a new CompactMerkleTree based on the data present in the
   // (non-compact) MerkleTree |model|.
-  // Takes ownership of |hasher|.
-  CompactMerkleTree(MerkleTree& model, SerialHasher* hasher);
+  // Takes ownership of |hasher|, does not use |model| after the
+  // construction.
+  // TODO(pphaneuf): This should take a const reference to the model,
+  // but implementation details currently make this too difficult.
+  // TODO(pphaneuf): It should also get its |hasher| from |model|,
+  // somehow.
+  CompactMerkleTree(MerkleTree* model, std::unique_ptr<SerialHasher> hasher);
 
   virtual ~CompactMerkleTree();
 
@@ -145,4 +154,5 @@ class CompactMerkleTree : public cert_trans::MerkleTreeInterface {
   // The root for |leaves_processed_| leaves.
   std::string root_;
 };
-#endif
+
+#endif  // CERT_TRANS_MERKLETREE_COMPACT_MERKLE_TREE_H_

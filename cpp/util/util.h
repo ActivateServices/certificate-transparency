@@ -1,10 +1,9 @@
-/* -*- mode: c++; indent-tabs-mode: nil -*- */
-
-#ifndef UTIL_H
-#define UTIL_H
+#ifndef CERT_TRANS_UTIL_UTIL_H_
+#define CERT_TRANS_UTIL_UTIL_H_
 
 #include <stdint.h>
 #include <string>
+#include <vector>
 
 namespace util {
 
@@ -37,6 +36,8 @@ std::string FromBase64(const char* b64);
 
 std::string ToBase64(const std::string& from);
 
+std::vector<std::string> split(const std::string& in, char delim = ',');
+
 }  // namespace util
 
-#endif  // ndef UTIL_H
+#endif  // CERT_TRANS_UTIL_UTIL_H_

@@ -7,6 +7,7 @@
 #include "log/signer.h"
 #include "log/test_signer.h"
 #include "log/verifier.h"
+#include "proto/cert_serializer.h"
 #include "proto/ct.pb.h"
 #include "proto/serializer.h"
 #include "util/testing.h"
@@ -38,7 +39,7 @@ class SignerVerifierTest : public ::testing::Test {
 
   static string SerializedSignature(const DigitallySigned& signature) {
     string serialized_sig;
-    CHECK_EQ(Serializer::OK,
+    CHECK_EQ(cert_trans::serialization::SerializeResult::OK,
              Serializer::SerializeDigitallySigned(signature, &serialized_sig));
     return serialized_sig;
   }
@@ -149,5 +150,6 @@ TEST_F(SignerVerifierTest, Errors) {
 
 int main(int argc, char** argv) {
   cert_trans::test::InitTesting(argv[0], &argc, &argv, true);
+  ConfigureSerializerForV1CT();
   return RUN_ALL_TESTS();
 }

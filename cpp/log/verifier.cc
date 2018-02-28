@@ -31,11 +31,7 @@ Verifier::Verifier(EVP_PKEY* pkey) : pkey_(CHECK_NOTNULL(pkey)) {
     default:
       LOG(FATAL) << "Unsupported key type " << pkey_->type;
   }
-  key_id_ = ComputeKeyID(pkey_);
-}
-
-Verifier::~Verifier() {
-  EVP_PKEY_free(pkey_);
+  key_id_ = ComputeKeyID(pkey_.get());
 }
 
 std::string Verifier::KeyID() const {
@@ -62,15 +58,14 @@ std::string Verifier::ComputeKeyID(EVP_PKEY* pkey) {
   unsigned char* buf = new unsigned char[buf_len];
   unsigned char* p = buf;
   CHECK_EQ(i2d_PUBKEY(pkey, &p), buf_len);
-  std::string keystring(reinterpret_cast<char*>(buf), buf_len);
-  std::string ret = Sha256Hasher::Sha256Digest(keystring);
+  const std::string keystring(reinterpret_cast<char*>(buf), buf_len);
+  const std::string ret(Sha256Hasher::Sha256Digest(keystring));
   delete[] buf;
   return ret;
 }
 
 Verifier::Verifier()
-    : pkey_(NULL),
-      hash_algo_(DigitallySigned::NONE),
+    : hash_algo_(DigitallySigned::NONE),
       sig_algo_(DigitallySigned::ANONYMOUS) {
 }
 
@@ -83,7 +78,7 @@ bool Verifier::RawVerify(const std::string& data,
   CHECK_EQ(1, EVP_VerifyUpdate(&ctx, data.data(), data.size()));
   bool ret = (EVP_VerifyFinal(&ctx, reinterpret_cast<const unsigned char*>(
                                         sig_string.data()),
-                              sig_string.size(), pkey_) == 1);
+                              sig_string.size(), pkey_.get()) == 1);
   EVP_MD_CTX_cleanup(&ctx);
   return ret;
 }

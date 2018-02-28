@@ -8,7 +8,9 @@ import (
 	"regexp"
 	"testing"
 
+	ct "github.com/google/certificate-transparency/go"
 	"github.com/google/certificate-transparency/go/client"
+	"github.com/google/certificate-transparency/go/jsonclient"
 	"github.com/google/certificate-transparency/go/x509"
 )
 
@@ -98,7 +100,7 @@ func TestScannerMatchSubjectRegexMatchesCertificateSAN(t *testing.T) {
 func TestScannerMatchSubjectRegexMatchesPrecertificateCommonName(t *testing.T) {
 	const SubjectName = "www.example.com"
 	const SubjectRegEx = ".*example.com"
-	var precert client.Precertificate
+	var precert ct.Precertificate
 	precert.TBSCertificate.Subject.CommonName = SubjectName
 
 	m := MatchSubjectRegex{nil, regexp.MustCompile(SubjectRegEx)}
@@ -110,7 +112,7 @@ func TestScannerMatchSubjectRegexMatchesPrecertificateCommonName(t *testing.T) {
 func TestScannerMatchSubjectRegexIgnoresDifferentPrecertificateCommonName(t *testing.T) {
 	const SubjectName = "www.google.com"
 	const SubjectRegEx = ".*example.com"
-	var precert client.Precertificate
+	var precert ct.Precertificate
 	precert.TBSCertificate.Subject.CommonName = SubjectName
 
 	m := MatchSubjectRegex{nil, regexp.MustCompile(SubjectRegEx)}
@@ -122,7 +124,7 @@ func TestScannerMatchSubjectRegexIgnoresDifferentPrecertificateCommonName(t *tes
 func TestScannerMatchSubjectRegexIgnoresDifferentPrecertificateSAN(t *testing.T) {
 	const SubjectName = "www.google.com"
 	const SubjectRegEx = ".*example.com"
-	var precert client.Precertificate
+	var precert ct.Precertificate
 	precert.TBSCertificate.Subject.CommonName = SubjectName
 
 	m := MatchSubjectRegex{nil, regexp.MustCompile(SubjectRegEx)}
@@ -138,7 +140,7 @@ func TestScannerMatchSubjectRegexIgnoresDifferentPrecertificateSAN(t *testing.T)
 func TestScannerMatchSubjectRegexMatchesPrecertificateSAN(t *testing.T) {
 	const SubjectName = "www.example.com"
 	const SubjectRegEx = ".*example.com"
-	var precert client.Precertificate
+	var precert ct.Precertificate
 	precert.TBSCertificate.Subject.CommonName = SubjectName
 
 	m := MatchSubjectRegex{nil, regexp.MustCompile(SubjectRegEx)}
@@ -170,10 +172,13 @@ func TestScannerEndToEnd(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	logClient := client.New(ts.URL)
+	logClient, err := client.New(ts.URL, &http.Client{}, jsonclient.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	opts := ScannerOptions{
 		Matcher:       &MatchSubjectRegex{regexp.MustCompile(".*\\.google\\.com"), nil},
-		BlockSize:     10,
+		BatchSize:     10,
 		NumWorkers:    1,
 		ParallelFetch: 1,
 		StartIndex:    0,
@@ -183,12 +188,12 @@ func TestScannerEndToEnd(t *testing.T) {
 	var matchedCerts list.List
 	var matchedPrecerts list.List
 
-	err := scanner.Scan(func(index int64, c *x509.Certificate) {
+	err = scanner.Scan(func(e *ct.LogEntry) {
 		// Annoyingly we can't t.Fatal() in here, as this is run in another go
 		// routine
-		matchedCerts.PushBack(*c)
-	}, func(index int64, p *client.Precertificate) {
-		matchedPrecerts.PushBack(p)
+		matchedCerts.PushBack(*e.X509Cert)
+	}, func(e *ct.LogEntry) {
+		matchedPrecerts.PushBack(*e.Precert)
 	})
 
 	if err != nil {
@@ -222,8 +227,8 @@ func TestDefaultScannerOptions(t *testing.T) {
 	if opts.PrecertOnly {
 		t.Fatal("Expected PrecertOnly to be false.")
 	}
-	if opts.BlockSize < 1 {
-		t.Fatalf("Insane BlockSize %d", opts.BlockSize)
+	if opts.BatchSize < 1 {
+		t.Fatalf("Insane BatchSize %d", opts.BatchSize)
 	}
 	if opts.NumWorkers < 1 {
 		t.Fatalf("Insane NumWorkers %d", opts.NumWorkers)

@@ -1,176 +1,251 @@
-// CT log client package contains types and code for interacting with
-// RFC6962-compliant CT Log instances.
+// Package client is a CT log client implementation and contains types and code
+// for interacting with RFC6962-compliant CT Log instances.
 // See http://tools.ietf.org/html/rfc6962 for details
 package client
 
 import (
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
-	"time"
+	"net/url"
+	"strconv"
 
-	"github.com/mreiferson/go-httpclient"
-)
-
-// URI paths for CT Log endpoints
-const (
-	GetSTHPath     = "/ct/v1/get-sth"
-	GetEntriesPath = "/ct/v1/get-entries"
-)
-
-const (
-	IssuerKeyHashLength = 32
+	ct "github.com/google/certificate-transparency/go"
+	"github.com/google/certificate-transparency/go/jsonclient"
+	"github.com/google/certificate-transparency/go/tls"
+	"github.com/google/certificate-transparency/go/x509"
+	"golang.org/x/net/context"
 )
 
 // LogClient represents a client for a given CT Log instance
 type LogClient struct {
-	uri        string       // the base URI of the log. e.g. http://ct.googleapis/pilot
-	httpClient *http.Client // used to interact with the log via HTTP
+	jsonclient.JSONClient
 }
 
-//////////////////////////////////////////////////////////////////////////////////
-// JSON structures follow.
-// These represent the structures returned by the CT Log server.
-//////////////////////////////////////////////////////////////////////////////////
-
-// addChainResponse represents the JSON response to the add-chain CT method.
-// An SCT represents a Log's promise to integrate a [pre-]certificate into the
-// log within a defined period of time.
-type addChainResponse struct {
-	SCTVersion Version `json:"sct_version"` // SCT structure version
-	ID         string  `json:"id"`          // Log ID
-	Timestamp  uint64  `json:"timestamp"`   // Timestamp of issuance
-	Extensions string  `json:"extensions"`  // Holder for any CT extensions
-	Signature  string  `json:"signature"`   // Log signature for this SCT
-}
-
-// getSTHResponse respresents the JSON response to the get-sth CT method
-type getSTHResponse struct {
-	TreeSize          uint64 `json:"tree_size"`           // Number of certs in the current tree
-	Timestamp         uint64 `json:"timestamp"`           // Time that the tree was created
-	SHA256RootHash    string `json:"sha256_root_hash"`    // Root hash of the tree
-	TreeHeadSignature string `json:"tree_head_signature"` // Log signature for this STH
-}
-
-// base64LeafEntry respresents a Base64 encoded leaf entry
-type base64LeafEntry struct {
-	LeafInput string `json:"leaf_input"`
-}
-
-// getEntriesReponse respresents the JSON response to the CT get-entries method
-type getEntriesResponse struct {
-	Entries []base64LeafEntry `json:"entries"` // the list of returned entries
-}
-
-// getConsistencyProofResponse represents the JSON response to the CT get-consistency-proof method
-type getConsistencyProofResponse struct {
-	Consistency []string `json:"consistency"`
-}
-
-// getAuditProofResponse represents the JSON response to the CT get-audit-proof method
-type getAuditProofResponse struct {
-	Hash     []string `json:"hash"`      // the hashes which make up the proof
-	TreeSize uint64   `json:"tree_size"` // the tree size against which this proof is constructed
-}
-
-// getAcceptedRootsResponse represents the JSON response to the CT get-roots method.
-type getAcceptedRootsResponse struct {
-	Certificates []string `json:"certificates"`
-}
-
-// getEntryAndProodReponse represents the JSON response to the CT get-entry-and-proof method
-type getEntryAndProofResponse struct {
-	LeafInput string   `json:"leaf_input"` // the entry itself
-	ExtraData string   `json:"extra_data"` // any chain provided when the entry was added to the log
-	AuditPath []string `json:"audit_path"` // the corresponding proof
-}
-
-// Constructs a new LogClient instance.
+// New constructs a new LogClient instance.
 // |uri| is the base URI of the CT log instance to interact with, e.g.
 // http://ct.googleapis.com/pilot
-func New(uri string) *LogClient {
-	var c LogClient
-	c.uri = uri
-	// TODO(alcutter): make these timeouts modifiable
-	transport := &httpclient.Transport{
-		ConnectTimeout:        10 * time.Second,
-		RequestTimeout:        30 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		MaxIdleConnsPerHost:   10,
-		DisableKeepAlives:     false,
-	}
-	c.httpClient = &http.Client{Transport: transport}
-	return &c
-}
-
-// Makes a HTTP call to |uri|, and attempts to parse the response as a JSON
-// representation of the structure in |res|.
-// Returns a non-nil |error| if there was a problem.
-func (c *LogClient) fetchAndParse(uri string, res interface{}) error {
-	req, _ := http.NewRequest("GET", uri, nil)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if err = json.Unmarshal(body, &res); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Retrieves the current STH from the log.
-// Returns a populated SignedTreeHead, or a non-nil error.
-func (c *LogClient) GetSTH() (sth *SignedTreeHead, err error) {
-	var resp getSTHResponse
-	if err = c.fetchAndParse(c.uri+GetSTHPath, &resp); err != nil {
-		return
-	}
-	sth = &SignedTreeHead{
-		TreeSize:  resp.TreeSize,
-		Timestamp: resp.Timestamp,
-	}
-	if sth.SHA256RootHash, err = base64.StdEncoding.DecodeString(resp.SHA256RootHash); err != nil {
-		return nil, errors.New("invalid base64 encoding in sha256_root_hash")
-	}
-	if len(sth.SHA256RootHash) != sha256.Size {
-		return nil, errors.New("sha256_root_hash is invalid length")
-	}
-	if sth.TreeHeadSignature, err = base64.StdEncoding.DecodeString(resp.TreeHeadSignature); err != nil {
-		return nil, errors.New("invalid base64 encoding in tree_head_signature")
-	}
-	// TODO(alcutter): Verify signature
-	return
-}
-
-// Attempts to retrieve the entries in the sequence [|start|, |end|] from the CT
-// log server. (see section 4.6.)
-// Returns a slice of LeafInputs or a non-nil error.
-func (c *LogClient) GetEntries(start, end int64) ([]LeafInput, error) {
-	if end < 0 {
-		return nil, errors.New("end should be >= 0")
-	}
-	if end < start {
-		return nil, errors.New("start should be <= end")
-	}
-	var resp getEntriesResponse
-	err := c.fetchAndParse(fmt.Sprintf("%s%s?start=%d&end=%d", c.uri, GetEntriesPath, start, end), &resp)
+// |hc| is the underlying client to be used for HTTP requests to the CT log.
+// |opts| can be used to provide a customer logger interface and a public key
+// for signature verification.
+func New(uri string, hc *http.Client, opts jsonclient.Options) (*LogClient, error) {
+	logClient, err := jsonclient.New(uri, hc, opts)
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]LeafInput, end-start+1, end-start+1)
-	for index, entry := range resp.Entries {
-		entries[index], err = base64.StdEncoding.DecodeString(entry.LeafInput)
+	return &LogClient{*logClient}, err
+}
+
+// Attempts to add |chain| to the log, using the api end-point specified by
+// |path|. If provided context expires before submission is complete an
+// error will be returned.
+func (c *LogClient) addChainWithRetry(ctx context.Context, ctype ct.LogEntryType, path string, chain []ct.ASN1Cert) (*ct.SignedCertificateTimestamp, error) {
+	var resp ct.AddChainResponse
+	var req ct.AddChainRequest
+	for _, link := range chain {
+		req.Chain = append(req.Chain, link.Data)
+	}
+
+	_, err := c.PostAndParseWithRetry(ctx, path, &req, &resp)
+	if err != nil {
+		return nil, err
+	}
+
+	var ds ct.DigitallySigned
+	if rest, err := tls.Unmarshal(resp.Signature, &ds); err != nil {
+		return nil, err
+	} else if len(rest) > 0 {
+		return nil, fmt.Errorf("trailing data (%d bytes) after DigitallySigned", len(rest))
+	}
+
+	var logID ct.LogID
+	copy(logID.KeyID[:], resp.ID)
+	sct := &ct.SignedCertificateTimestamp{
+		SCTVersion: resp.SCTVersion,
+		LogID:      logID,
+		Timestamp:  resp.Timestamp,
+		Extensions: ct.CTExtensions(resp.Extensions),
+		Signature:  ds,
+	}
+	err = c.VerifySCTSignature(*sct, ctype, chain)
+	if err != nil {
+		return nil, err
+	}
+	return sct, nil
+}
+
+// AddChain adds the (DER represented) X509 |chain| to the log.
+func (c *LogClient) AddChain(ctx context.Context, chain []ct.ASN1Cert) (*ct.SignedCertificateTimestamp, error) {
+	return c.addChainWithRetry(ctx, ct.X509LogEntryType, ct.AddChainPath, chain)
+}
+
+// AddPreChain adds the (DER represented) Precertificate |chain| to the log.
+func (c *LogClient) AddPreChain(ctx context.Context, chain []ct.ASN1Cert) (*ct.SignedCertificateTimestamp, error) {
+	return c.addChainWithRetry(ctx, ct.PrecertLogEntryType, ct.AddPreChainPath, chain)
+}
+
+// AddJSON submits arbitrary data to to XJSON server.
+func (c *LogClient) AddJSON(ctx context.Context, data interface{}) (*ct.SignedCertificateTimestamp, error) {
+	req := ct.AddJSONRequest{Data: data}
+	var resp ct.AddChainResponse
+	_, err := c.PostAndParse(ctx, ct.AddJSONPath, &req, &resp)
+	if err != nil {
+		return nil, err
+	}
+	var ds ct.DigitallySigned
+	if rest, err := tls.Unmarshal(resp.Signature, &ds); err != nil {
+		return nil, err
+	} else if len(rest) > 0 {
+		return nil, fmt.Errorf("trailing data (%d bytes) after DigitallySigned", len(rest))
+	}
+	var logID ct.LogID
+	copy(logID.KeyID[:], resp.ID)
+	return &ct.SignedCertificateTimestamp{
+		SCTVersion: resp.SCTVersion,
+		LogID:      logID,
+		Timestamp:  resp.Timestamp,
+		Extensions: ct.CTExtensions(resp.Extensions),
+		Signature:  ds,
+	}, nil
+}
+
+// GetSTH retrieves the current STH from the log.
+// Returns a populated SignedTreeHead, or a non-nil error.
+func (c *LogClient) GetSTH(ctx context.Context) (sth *ct.SignedTreeHead, err error) {
+	var resp ct.GetSTHResponse
+	_, err = c.GetAndParse(ctx, ct.GetSTHPath, nil, &resp)
+	if err != nil {
+		return
+	}
+	sth = &ct.SignedTreeHead{
+		TreeSize:  resp.TreeSize,
+		Timestamp: resp.Timestamp,
+	}
+
+	if len(resp.SHA256RootHash) != sha256.Size {
+		return nil, fmt.Errorf("sha256_root_hash is invalid length, expected %d got %d", sha256.Size, len(resp.SHA256RootHash))
+	}
+	copy(sth.SHA256RootHash[:], resp.SHA256RootHash)
+
+	var ds ct.DigitallySigned
+	if rest, err := tls.Unmarshal(resp.TreeHeadSignature, &ds); err != nil {
+		return nil, err
+	} else if len(rest) > 0 {
+		return nil, fmt.Errorf("trailing data (%d bytes) after DigitallySigned", len(rest))
+	}
+	sth.TreeHeadSignature = ds
+	err = c.VerifySTHSignature(*sth)
+	if err != nil {
+		return nil, err
+	}
+	return
+}
+
+// VerifySTHSignature checks the signature in sth, returning any error encountered or nil if verification is
+// successful.
+func (c *LogClient) VerifySTHSignature(sth ct.SignedTreeHead) error {
+	if c.Verifier == nil {
+		// Can't verify signatures without a verifier
+		return nil
+	}
+	return c.Verifier.VerifySTHSignature(sth)
+}
+
+// VerifySCTSignature checks the signature in sct for the given LogEntryType, with associated certificate chain.
+func (c *LogClient) VerifySCTSignature(sct ct.SignedCertificateTimestamp, ctype ct.LogEntryType, certData []ct.ASN1Cert) error {
+	if c.Verifier == nil {
+		// Can't verify signatures without a verifier
+		return nil
+	}
+
+	// Build enough of a Merkle tree leaf for the verifier to work on.
+	leaf := ct.MerkleTreeLeaf{
+		Version:  sct.SCTVersion,
+		LeafType: ct.TimestampedEntryLeafType,
+		TimestampedEntry: &ct.TimestampedEntry{
+			Timestamp:  sct.Timestamp,
+			EntryType:  ctype,
+			Extensions: sct.Extensions,
+		},
+	}
+	if ctype == ct.X509LogEntryType {
+		leaf.TimestampedEntry.X509Entry = &certData[0]
+	} else {
+		// Pre-certs are more complicated; we need the issuer key hash and the
+		// DER-encoded TBSCertificate.  First, parse the issuer to get its
+		// public key hash.
+		if len(certData) < 2 {
+			return fmt.Errorf("no issuer cert available for precert SCT validation")
+		}
+		issuer, err := x509.ParseCertificate(certData[1].Data)
+		if err != nil {
+			return fmt.Errorf("failed to parse issuer cert: %v", err)
+		}
+		issuerKeyHash := sha256.Sum256(issuer.RawSubjectPublicKeyInfo)
+
+		// Second, parse the pre-certificate to extract its DER-encoded
+		// TBSCertificate, then post-process this to remove the CT poison
+		// extension.
+		cert, err := x509.ParseCertificate(certData[0].Data)
+		if err != nil {
+			return fmt.Errorf("failed to parse leaf pre-cert: %v", err)
+		}
+		defangedTBS, err := x509.RemoveCTPoison(cert.RawTBSCertificate)
+		if err != nil {
+			return fmt.Errorf("failed to remove poison extension: %v", err)
+		}
+		leaf.TimestampedEntry.PrecertEntry = &ct.PreCert{
+			IssuerKeyHash:  issuerKeyHash,
+			TBSCertificate: defangedTBS,
+		}
+	}
+	entry := ct.LogEntry{Leaf: leaf}
+	return c.Verifier.VerifySCTSignature(sct, entry)
+}
+
+// GetSTHConsistency retrieves the consistency proof between two snapshots.
+func (c *LogClient) GetSTHConsistency(ctx context.Context, first, second uint64) ([][]byte, error) {
+	base10 := 10
+	params := map[string]string{
+		"first":  strconv.FormatUint(first, base10),
+		"second": strconv.FormatUint(second, base10),
+	}
+	var resp ct.GetSTHConsistencyResponse
+	if _, err := c.GetAndParse(ctx, ct.GetSTHConsistencyPath, params, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Consistency, nil
+}
+
+// GetProofByHash returns an audit path for the hash of an SCT.
+func (c *LogClient) GetProofByHash(ctx context.Context, hash []byte, treeSize uint64) (*ct.GetProofByHashResponse, error) {
+	b64Hash := url.QueryEscape(base64.StdEncoding.EncodeToString(hash))
+	base10 := 10
+	params := map[string]string{
+		"tree_size": strconv.FormatUint(treeSize, base10),
+		"hash":      b64Hash,
+	}
+	var resp ct.GetProofByHashResponse
+	if _, err := c.GetAndParse(ctx, ct.GetProofByHashPath, params, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetAcceptedRoots retrieves the set of acceptable root certificates for a log.
+func (c *LogClient) GetAcceptedRoots(ctx context.Context) ([]ct.ASN1Cert, error) {
+	var resp ct.GetRootsResponse
+	if _, err := c.GetAndParse(ctx, ct.GetRootsPath, nil, &resp); err != nil {
+		return nil, err
+	}
+	var roots []ct.ASN1Cert
+	for _, cert64 := range resp.Certificates {
+		cert, err := base64.StdEncoding.DecodeString(cert64)
 		if err != nil {
 			return nil, err
 		}
+		roots = append(roots, ct.ASN1Cert{Data: cert})
 	}
-	return entries, nil
+	return roots, nil
 }

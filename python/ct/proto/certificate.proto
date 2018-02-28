@@ -1,6 +1,8 @@
 syntax = "proto2";
 
-package ct;
+package ctpy;
+
+import "ct/proto/client.proto";
 
 message Validity {
   // Milliseconds since epoch.
@@ -20,14 +22,6 @@ message DNAttribute {
   optional string type = 1;
 
   optional string value = 2;
-}
-
-message Observation {
-  optional string description = 1;
-
-  optional string reason = 2;
-
-  optional bytes details = 3;
 }
 
 message X509Description {
@@ -55,7 +49,16 @@ message X509Description {
   // SHA256 hash from DER form.
   optional bytes sha256_hash = 10;
 
-  repeated Observation observations = 11;
+  // Field 11 was Observation, no longer produced.
 
   repeated DNAttribute root_issuer = 12;
+
+  // Type of Log Entry this cert came from: X509 or PRECERT.
+  optional LogEntryType entry_type = 13;
+
+  // True if this cert has the Basic Constraint CA=TRUE.
+  optional bool basic_constraint_ca = 14;
+
+  // SHA256 hash of issuer's public key.
+  optional bytes issuer_pk_sha256_hash = 15;
 }

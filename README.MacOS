@@ -1,8 +1,0 @@
-gtest: install from source.
-
-glog: brew install glog (note: this may cause linking problems if
-installed before gflags, so possibly first do: brew install gflags)
-
-protocol buffers: brew install protobuf
-
-json-c: brew install json-c

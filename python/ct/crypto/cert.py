@@ -56,6 +56,23 @@ class Certificate(object):
     def __str__(self):
         return self._asn1_cert.human_readable(label=self.__class__.__name__)
 
+    def __eq__(self, other):
+        if isinstance(other, type(self)):
+            return self.is_identical_to(other)
+        else:
+            return NotImplemented
+
+    def __ne__(self, other):
+        are_equal = self.__eq__(other)
+
+        if are_equal is NotImplemented:
+            return NotImplemented
+        else:
+            return not are_equal
+
+    def __hash__(self):
+        return hash(self.fingerprint())
+
     @classmethod
     def from_pem(cls, pem_string, strict_der=True):
         """Read a single PEM-encoded certificate from a string.
@@ -75,6 +92,7 @@ class Certificate(object):
         return cls.from_der(der_cert, strict_der=strict_der)
 
     def _has_multiple_extension_values(self):
+        """Returns true if any extension appears more than once."""
         extns = self._asn1_cert["tbsCertificate"]["extensions"] or []
         extn_value_count = collections.Counter([e["extnID"] for e in extns])
         return any([c > 1 for c in extn_value_count.values()])
@@ -176,18 +194,24 @@ class Certificate(object):
             certificate
             IOError: the file could not be read.
         """
-        with open(der_file, "rb") as f:
-            return cls.from_der(f.read(), strict_der=strict_der)
+        with open(der_file, "rb") as der_cert_file:
+            return cls.from_der(der_cert_file.read(), strict_der=strict_der)
 
     def to_der(self):
         """Get the DER-encoding of the certificate."""
         return self._asn1_cert.encode()
 
     def to_pem(self):
-      return pem.to_pem(self._asn1_cert.encode(), self.PEM_MARKERS[0])
+        """Get the PEM-encoding of the certificate."""
+        return pem.to_pem(self._asn1_cert.encode(), self.PEM_MARKERS[0])
 
     def is_identical_to(self, other_cert):
+        """Returns True if this certificate is identical to |other_cert|."""
         return self.to_der() == other_cert.to_der()
+
+    def to_asn1(self):
+        """Get a copy of the ASN.1 representation of the certificate."""
+        return x509.Certificate.decode(self._asn1_cert.encode())
 
     def get_extensions(self):
         """Get all extensions.
@@ -196,6 +220,14 @@ class Certificate(object):
             a list of extensions.
         """
         return self._asn1_cert["tbsCertificate"]["extensions"] or []
+
+    def tbscertificate(self):
+        """Returns the underlying tbsCertificate
+
+        Returns:
+            An x509.TBSCertificate instance.
+        """
+        return self._asn1_cert["tbsCertificate"]
 
     def version(self):
         """Get the version.
@@ -248,7 +280,7 @@ class Certificate(object):
         try:
             return self._asn1_cert["tbsCertificate"]["subject"].attributes(
                 oid.ID_AT_COMMON_NAME)
-        except error.ASN1Error as e:
+        except error.ASN1Error:
             raise CertificateError("Corrupt common name attribute")
 
     def subject_organization_name(self):
@@ -264,7 +296,8 @@ class Certificate(object):
             return self._asn1_cert["tbsCertificate"]["subject"].attributes(
                     oid.ID_AT_ORGANIZATION_NAME)
         except error.ASN1Error:
-            raise CertificateError("Corrupt subject organization name attribute.")
+            raise CertificateError("Corrupt subject organization name "
+                                   "attribute.")
 
     def subject_street_address(self):
         """Get subject street address.
@@ -383,7 +416,7 @@ class Certificate(object):
         subject_alternative_names fashion.
         """
         subject = self._asn1_cert["tbsCertificate"]["subject"]
-        return [(sub['type'],  sub['value'])
+        return [(sub['type'], sub['value'])
                 for sub in subject.flatten()]
 
     def issuer(self):
@@ -391,10 +424,11 @@ class Certificate(object):
         subject method fashion.
         """
         issuer = self._asn1_cert["tbsCertificate"]["issuer"]
-        return [(iss['type'],  iss['value'])
+        return [(iss['type'], iss['value'])
                 for iss in issuer.flatten()]
 
     def _get_subject_alt_names_by_type(self, san_type):
+        """Returns the SAN extension values corresponding to |san_type|"""
         # A certificate should only have one SAN extension but we can't rely on
         # this (in non-strict mode), so we return everything we find.
         sans = self._get_decoded_extension_values(oid.ID_CE_SUBJECT_ALT_NAME)
@@ -462,7 +496,7 @@ class Certificate(object):
         """Get TBSCertificate signature.
 
         Returns:
-            an AlgorithmIdentifier.
+            an ASN.1 BitString.
         """
         return self._asn1_cert["tbsCertificate"]["signature"]
 
@@ -617,6 +651,20 @@ class Certificate(object):
         h.update(self._asn1_cert.encode())
         return h.digest()
 
+    def key_hash(self, hashfunc="sha1"):
+        """Get the certificate's public key hash.
+
+        Args:
+            hashfunc: name of a hash function. Algorithms always present are
+                'md5', 'sha1', 'sha224', 'sha256', 'sha384', and 'sha512'.
+        Returns:
+            a (binary) hash digest of the public key.
+        """
+        h = hashlib.new(hashfunc)
+        h.update(
+            self._asn1_cert["tbsCertificate"]["subjectPublicKeyInfo"].encode())
+        return h.digest()
+
     def key_usage(self, key_usage):
         """Whether the certificate has the given key usage asserted.
 
@@ -697,42 +745,43 @@ class Certificate(object):
         return self._get_decoded_extension_value(oid.ID_CE_EXT_KEY_USAGE) or []
 
     def subject_key_identifier(self):
-      """Get the subject key identifier.
+        """Get the subject key identifier.
 
-      Returns:
-          An x509_extension.KeyIdentifier (ASN.1 OctetString) holding the value
-              of the subject key identifier, or None if the subject key
-              identifier extension is not present.
-      Raises:
-          CertificateError: corrupt extension, or multiple extension values.
-      """
-      return self._get_decoded_extension_value(oid.ID_CE_SUBJECT_KEY_IDENTIFIER)
+        Returns:
+            An x509_extension.KeyIdentifier (ASN.1 OctetString) holding the
+            value of the subject key identifier, or None if the subject key
+            identifier extension is not present.
+        Raises:
+            CertificateError: corrupt extension, or multiple extension values.
+        """
+        return self._get_decoded_extension_value(
+            oid.ID_CE_SUBJECT_KEY_IDENTIFIER)
 
     def authority_key_identifier(self, identifier_type=x509_ext.KEY_IDENTIFIER):
-      """Get the authority key identifier of the given type.
+        """Get the authority key identifier of the given type.
 
-      Args:
-          identifier_type: the identifier component to fetch, one of
+        Args:
+            identifier_type: the identifier component to fetch, one of
               x509_extension.KEY_IDENTIFIER,
               x509_extension.AUTHORITY_CERT_ISSUER,
               x509_extension.AUTHORITY_CERT_SERIAL_NUMBER.
 
-      Returns:
-          the identifier component of the appropriate type, or None if the
-          component/extension is not present. The types are
+        Returns:
+            the identifier component of the appropriate type, or None if the
+            component/extension is not present. The types are
               x509_extension.KEY_IDENTIFIER: x509_extension.KeyIdentifier
                   (an OCTET STRING),
               x509_extension.AUTHORITY_CERT_ISSUER: x509_name.GeneralNames,
               x509_extension.AUTHORITY_CERT_SERIAL_NUMBER:
                   x509_common.CertificateSerialNumber.
 
-      Raises:
-          CertificateError: corrupt extension, or multiple extension values.
-      """
-      akid = self._get_decoded_extension_value(
-          oid.ID_CE_AUTHORITY_KEY_IDENTIFIER)
+        Raises:
+            CertificateError: corrupt extension, or multiple extension values.
+        """
+        akid = self._get_decoded_extension_value(
+            oid.ID_CE_AUTHORITY_KEY_IDENTIFIER)
 
-      return akid[identifier_type] if akid else None
+        return akid[identifier_type] if akid else None
 
     def policies(self):
         """List certificate policies.
@@ -826,6 +875,35 @@ class Certificate(object):
         return [a[x509_ext.ACCESS_LOCATION] for a in aia
                 if a[x509_ext.ACCESS_METHOD] == oid.ID_AD_OCSP]
 
+    def embedded_sct_list(self):
+        """Get the encoded list of embedded timestamps
+
+        Returns:
+            bytes representing a TLS encoded SignedCertificateTimestampList,
+            or None if not present
+
+        Raises:
+            CertificateError: corrupt extension, or multiple extension values.
+        """
+        signed_certificate_timestamp_list = (
+                self._get_decoded_extension_value(oid.CT_EMBEDDED_SCT_LIST))
+        if signed_certificate_timestamp_list is None:
+            return None
+        return signed_certificate_timestamp_list.value
+
+    def has_extension(self, extn_id):
+        """Check if certificate contains a given extnsion.
+
+        Args:
+            extn_id: extension OID.
+
+        Returns:
+            True or False
+
+        Raises:
+            CertificateError: corrupt extension, or multiple extension values.
+        """
+        return self._get_decoded_extension_value(extn_id) is not None
 
 def certs_from_pem(pem_string, skip_invalid_blobs=False, strict_der=True):
     """Read multiple PEM-encoded certificates from a string.

@@ -4,6 +4,7 @@
 
 #include <string>
 
+#include "proto/cert_serializer.h"
 #include "util/testing.h"
 
 
@@ -24,13 +25,13 @@ TYPED_TEST(LoggedTest, NonEmptyHash) {
 TYPED_TEST(LoggedTest, SequenceIsPreserved) {
   TypeParam l1;
   l1.set_sequence_number(42);
-  EXPECT_EQ(l1.sequence_number(), (uint64_t)42);
+  EXPECT_EQ(l1.sequence_number(), (int64_t)42);
 }
 
 TYPED_TEST(LoggedTest, SequenceIsNotPreserved) {
   TypeParam l1;
   l1.set_sequence_number(42);
-  EXPECT_EQ(l1.sequence_number(), (uint64_t)42);
+  EXPECT_EQ(l1.sequence_number(), (int64_t)42);
 
   std::string s1;
   EXPECT_TRUE(l1.SerializeForDatabase(&s1));
@@ -98,6 +99,7 @@ TYPED_TEST(LoggedTest, DifferentMerkleSerialization) {
 
 int main(int argc, char** argv) {
   cert_trans::test::InitTesting(argv[0], &argc, &argv, true);
+  ConfigureSerializerForV1CT();
   srand(time(NULL));
   return RUN_ALL_TESTS();
 }

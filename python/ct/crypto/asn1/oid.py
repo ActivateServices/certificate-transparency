@@ -165,17 +165,23 @@ ID_DSA = ObjectIdentifier(value="1.2.840.10040.4.1")
 ID_DSA_WITH_SHA1 = ObjectIdentifier(value="1.2.840.10040.4.3")
 ID_EC_PUBLICKEY = ObjectIdentifier(value="1.2.840.10045.2.1")
 ECDSA_WITH_SHA1 = ObjectIdentifier(value="1.2.840.10045.4.1")
-# http://tools.ietf.org/html/rfc5758
+# RFC 5758
 ECDSA_WITH_SHA224 = ObjectIdentifier(value="1.2.840.10045.4.3.1")
 ECDSA_WITH_SHA256 = ObjectIdentifier(value="1.2.840.10045.4.3.2")
 ECDSA_WITH_SHA384 = ObjectIdentifier(value="1.2.840.10045.4.3.3")
 ECDSA_WITH_SHA512 = ObjectIdentifier(value="1.2.840.10045.4.3.4")
-# RFC4055
+# RFC 4055
 ID_RSASSA_PSS = ObjectIdentifier(value="1.2.840.113549.1.1.10")
+ID_SHA256_WITH_RSA_ENCRYPTION = ObjectIdentifier(value="1.2.840.113549.1.1.11")
+ID_SHA384_WITH_RSA_ENCRYPTION = ObjectIdentifier(value="1.2.840.113549.1.1.12")
+ID_SHA512_WITH_RSA_ENCRYPTION = ObjectIdentifier(value="1.2.840.113549.1.1.13")
+ID_SHA224_WITH_RSA_ENCRYPTION = ObjectIdentifier(value="1.2.840.113549.1.1.14")
 # RFC 4491
 ID_GOSTR3411_94_WITH_GOSTR3410_94 = ObjectIdentifier(value="1.2.643.2.2.4")
 ID_GOSTR3411_94_WITH_GOSTR3410_2001 = ObjectIdentifier(value="1.2.643.2.2.3")
-
+# RFC 5758
+ID_DSA_WITH_SHA224 = ObjectIdentifier(value="2.16.840.1.101.3.4.3.1")
+ID_DSA_WITH_SHA256 = ObjectIdentifier(value="2.16.840.1.101.3.4.3.2")
 # Naming attributes (RFC 5280)
 ID_AT_NAME = ObjectIdentifier(value="2.5.4.41")
 ID_AT_SURNAME = ObjectIdentifier(value="2.5.4.4")
@@ -237,6 +243,11 @@ ID_QT_CPS = ObjectIdentifier(value="1.3.6.1.5.5.7.2.1")
 ID_QT_UNOTICE = ObjectIdentifier(value="1.3.6.1.5.5.7.2.2")
 ANY_POLICY = ObjectIdentifier(value="2.5.29.32.0")
 
+# CT Specific
+CT_EMBEDDED_SCT_LIST = ObjectIdentifier(value="1.3.6.1.4.1.11129.2.4.2")
+CT_POISON = ObjectIdentifier(value="1.3.6.1.4.1.11129.2.4.3")
+CT_PRECERTIFICATE_SIGNING = ObjectIdentifier(value="1.3.6.1.4.1.11129.2.4.4")
+
 _OID_NAME_DICT = {
     # Object identifier long names taken verbatim from the RFCs.
     # Short names are colloquial.
@@ -257,6 +268,12 @@ _OID_NAME_DICT = {
                                         "GOST94"),
     ID_GOSTR3411_94_WITH_GOSTR3410_2001: ("id-GostR3411-94-with-GostR3410-2001",
                                           "GOST2001"),
+    ID_SHA256_WITH_RSA_ENCRYPTION: ("sha256WithRSAEncryption", "RSA-SHA256"),
+    ID_SHA384_WITH_RSA_ENCRYPTION: ("sha384WithRSAEncryption", "RSA-SHA384"),
+    ID_SHA512_WITH_RSA_ENCRYPTION: ("sha512WithRSAEncryption", "RSA-SHA512"),
+    ID_SHA224_WITH_RSA_ENCRYPTION: ("sha224WithRSAEncryption", "RSA-SHA224"),
+    ID_DSA_WITH_SHA224: ("id-dsa-with-sha224", "DSA-SHA224"),
+    ID_DSA_WITH_SHA256: ("id-dsa-with-sha256", "DSA-SHA256"),
     ID_AT_NAME: ("id-at-name", "name"),
     ID_AT_SURNAME: ("id-at-surname", "surname"),
     ID_AT_GIVEN_NAME: ("id-at-givenName", "givenName"),
@@ -315,7 +332,11 @@ _OID_NAME_DICT = {
     ID_AD_CA_ISSUERS: ("id-ad-caIssuers", "caIssuers"),
     ID_QT_CPS: ("id-qt-cps", "CPS"),
     ID_QT_UNOTICE: ("id-qt-unotice", "UserNotice"),
-    ANY_POLICY: ("anyPolicy", "anyPolicy")
+    ANY_POLICY: ("anyPolicy", "anyPolicy"),
+
+    CT_EMBEDDED_SCT_LIST: ("ctEmbeddedSCT", "ctEmbeddedSCT"),
+    CT_POISON: ("ctPoison", "ctPoison"),
+    CT_PRECERTIFICATE_SIGNING: ("ctPrecertificateSigningCert", "ctPrecertificateSigningCert")
     }
 
 _OID_DECODING_DICT = {}

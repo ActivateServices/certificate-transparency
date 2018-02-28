@@ -3,9 +3,12 @@
 #include <stddef.h>
 #include <vector>
 
+using std::move;
 using std::string;
+using std::unique_ptr;
 
-MerkleVerifier::MerkleVerifier(SerialHasher* hasher) : treehasher_(hasher) {
+MerkleVerifier::MerkleVerifier(unique_ptr<SerialHasher> hasher)
+    : treehasher_(move(hasher)) {
 }
 
 MerkleVerifier::~MerkleVerifier() {

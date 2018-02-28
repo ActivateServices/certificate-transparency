@@ -1,161 +1,108 @@
 #include "server/handler.h"
 
-#include <algorithm>
-#include <event2/buffer.h>
-#include <event2/http.h>
-#include <event2/keyvalq_struct.h>
-#include <functional>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <map>
-#include <memory>
+#include <stdint.h>
 #include <stdlib.h>
-#include <utility>
+#include <algorithm>
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "log/cert.h"
 #include "log/cert_checker.h"
-#include "log/frontend.h"
+#include "log/cluster_state_controller.h"
 #include "log/log_lookup.h"
-#include "log/logged_certificate.h"
+#include "log/logged_entry.h"
+#include "monitoring/latency.h"
+#include "monitoring/monitoring.h"
+#include "server/json_output.h"
+#include "server/proxy.h"
 #include "util/json_wrapper.h"
 #include "util/thread_pool.h"
 
-using cert_trans::Cert;
-using cert_trans::CertChain;
-using cert_trans::CertChecker;
+namespace libevent = cert_trans::libevent;
+
+using cert_trans::Counter;
 using cert_trans::HttpHandler;
-using cert_trans::LoggedCertificate;
+using cert_trans::Latency;
+using cert_trans::LoggedEntry;
+using cert_trans::Proxy;
+using cert_trans::ScopedLatency;
 using ct::ShortMerkleAuditProof;
 using ct::SignedCertificateTimestamp;
 using ct::SignedTreeHead;
 using std::bind;
-using std::make_pair;
+using std::chrono::milliseconds;
+using std::chrono::seconds;
+using std::lock_guard;
 using std::make_shared;
 using std::multimap;
+using std::min;
+using std::mutex;
 using std::placeholders::_1;
-using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
 
 DEFINE_int32(max_leaf_entries_per_response, 1000,
-             "Maximum number of entries "
-             "to put in the response of a get-entries request.");
+             "maximum number of entries to put in the response of a "
+             "get-entries request");
 
 namespace {
 
 
-const char kJsonContentType[] = "application/json; charset=ISO-8859-1";
+static Latency<milliseconds, string> http_server_request_latency_ms(
+    "total_http_server_request_latency_ms", "path",
+    "Total request latency in ms broken down by path");
 
 
-void LogRequest(evhttp_request* req, int http_status, int resp_body_length) {
-  evhttp_connection* conn = evhttp_request_get_connection(req);
-  char* peer_addr;
-  ev_uint16_t peer_port;
-  evhttp_connection_get_peer(conn, &peer_addr, &peer_port);
+}  // namespace
 
-  string http_verb;
-  switch (evhttp_request_get_command(req)) {
-    case EVHTTP_REQ_DELETE:
-      http_verb = "DELETE";
-      break;
-    case EVHTTP_REQ_GET:
-      http_verb = "GET";
-      break;
-    case EVHTTP_REQ_HEAD:
-      http_verb = "HEAD";
-      break;
-    case EVHTTP_REQ_POST:
-      http_verb = "POST";
-      break;
-    case EVHTTP_REQ_PUT:
-      http_verb = "PUT";
-      break;
-    default:
-      http_verb = "UNKNOWN";
-      break;
-  }
 
-  const string uri(evhttp_request_get_uri(req));
-  LOG(INFO) << string(peer_addr) << " \"" << http_verb << " " << uri << "\" "
-            << http_status << " " << resp_body_length;
+HttpHandler::HttpHandler(LogLookup* log_lookup, const ReadOnlyDatabase* db,
+                         const ClusterStateController* controller,
+                         ThreadPool* pool, libevent::Base* event_base,
+                         StalenessTracker* staleness_tracker)
+    : log_lookup_(CHECK_NOTNULL(log_lookup)),
+      db_(CHECK_NOTNULL(db)),
+      controller_(CHECK_NOTNULL(controller)),
+      proxy_(nullptr),
+      pool_(CHECK_NOTNULL(pool)),
+      event_base_(CHECK_NOTNULL(event_base)),
+      staleness_tracker_(CHECK_NOTNULL(staleness_tracker)) {
 }
 
 
-void SendJsonReply(evhttp_request* req, int http_status,
-                   const JsonObject& json) {
-  CHECK_EQ(evhttp_add_header(evhttp_request_get_output_headers(req),
-                             "Content-Type", kJsonContentType),
-           0);
-  const string resp_body(json.ToString());
-  CHECK_GT(evbuffer_add_printf(evhttp_request_get_output_buffer(req), "%s",
-                               resp_body.c_str()),
-           0);
-
-  evhttp_send_reply(req, http_status, /*reason*/ NULL, /*databuf*/ NULL);
-  LogRequest(req, http_status, resp_body.size());
+HttpHandler::~HttpHandler() {
 }
 
 
-void SendError(evhttp_request* req, int http_status, const string& error_msg) {
-  JsonObject json_reply;
-  json_reply.Add("error_message", error_msg);
-  json_reply.AddBoolean("success", false);
+void StatsHandlerInterceptor(const string& path,
+                             const libevent::HttpServer::HandlerCallback& cb,
+                             evhttp_request* req) {
+  ScopedLatency total_http_server_request_latency(
+      http_server_request_latency_ms.GetScopedLatency(path));
 
-  SendJsonReply(req, http_status, json_reply);
+  cb(req);
 }
 
 
-bool ExtractChain(evhttp_request* req, CertChain* chain) {
-  if (evhttp_request_get_command(req) != EVHTTP_REQ_POST) {
-    SendError(req, HTTP_BADMETHOD, "Method not allowed.");
-    return false;
-  }
-
-  // TODO(pphaneuf): Should we check that Content-Type says
-  // "application/json", as recommended by RFC4627?
-  JsonObject json_body(evhttp_request_get_input_buffer(req));
-  if (!json_body.Ok() || !json_body.IsType(json_type_object)) {
-    SendError(req, HTTP_BADREQUEST, "Unable to parse provided JSON.");
-    return false;
-  }
-
-  JsonArray json_chain(json_body, "chain");
-  if (!json_chain.Ok()) {
-    SendError(req, HTTP_BADREQUEST, "Unable to parse provided JSON.");
-    return false;
-  }
-
-  VLOG(1) << "ExtractChain chain:\n" << json_chain.DebugString();
-
-  for (int i = 0; i < json_chain.Length(); ++i) {
-    JsonString json_cert(json_chain, i);
-    if (!json_cert.Ok()) {
-      SendError(req, HTTP_BADREQUEST, "Unable to parse provided JSON.");
-      return false;
-    }
-
-    unique_ptr<Cert> cert(new Cert);
-    cert->LoadFromDerString(json_cert.FromBase64());
-    if (!cert->IsLoaded()) {
-      SendError(req, HTTP_BADREQUEST, "Unable to parse provided chain.");
-      return false;
-    }
-
-    chain->AddCert(cert.release());
-  }
-
-  return true;
-}
-
-
-void AddChainReply(evhttp_request* req, SubmitResult result,
-                   const SignedCertificateTimestamp& sct) {
-  if (result != ADDED && result != DUPLICATE) {
-    const string error(Frontend::SubmitResultString(result));
-    VLOG(1) << "error adding chain: " << error;
-    return SendError(req, HTTP_BADREQUEST, error);
+void HttpHandler::AddEntryReply(evhttp_request* req,
+                                const util::Status& add_status,
+                                const SignedCertificateTimestamp& sct) const {
+  if (!add_status.ok() &&
+      add_status.CanonicalCode() != util::error::ALREADY_EXISTS) {
+    VLOG(1) << "error adding chain: " << add_status;
+    const int response_code(add_status.CanonicalCode() ==
+                                    util::error::RESOURCE_EXHAUSTED
+                                ? HTTP_SERVUNAVAIL
+                                : HTTP_BADREQUEST);
+    return SendJsonError(event_base_, req, response_code,
+                         add_status.error_message());
   }
 
   JsonObject json_reply;
@@ -165,202 +112,124 @@ void AddChainReply(evhttp_request* req, SubmitResult result,
   json_reply.Add("extensions", "");
   json_reply.Add("signature", sct.signature());
 
-  SendJsonReply(req, HTTP_OK, json_reply);
+  SendJsonReply(event_base_, req, HTTP_OK, json_reply);
+}
+
+void HttpHandler::ProxyInterceptor(
+    const libevent::HttpServer::HandlerCallback& local_handler,
+    evhttp_request* request) {
+  VLOG(2) << "Running proxy interceptor...";
+  // TODO(alcutter): We can be a bit smarter about when to proxy off
+  // the request - being stale wrt to the current serving STH doesn't
+  // automatically mean we're unable to answer this request.
+  if (staleness_tracker_->IsNodeStale()) {
+    // Can't do this on the libevent thread since it can block on the lock in
+    // ClusterStatusController::GetFreshNodes().
+    pool_->Add(bind(&Proxy::ProxyRequest, proxy_, request));
+  } else {
+    local_handler(request);
+  }
 }
 
 
-multimap<string, string> ParseQuery(evhttp_request* req) {
-  evkeyvalq keyval;
-  multimap<string, string> retval;
-
-  // We return an empty result in case of a parsing error.
-  if (evhttp_parse_query_str(evhttp_uri_get_query(
-                                 evhttp_request_get_evhttp_uri(req)),
-                             &keyval) == 0) {
-    for (evkeyval* i = keyval.tqh_first; i; i = i->next.tqe_next) {
-      retval.insert(make_pair(i->key, i->value));
-    }
-  }
-
-  return retval;
-}
-
-
-bool GetParam(const multimap<string, string>& query, const string& param,
-              string* value) {
-  CHECK_NOTNULL(value);
-
-  multimap<string, string>::const_iterator it = query.find(param);
-  if (it == query.end()) {
-    return false;
-  }
-
-  const string possible_value(it->second);
-  ++it;
-
-  // Flag duplicate query parameters as invalid.
-  const bool retval(it == query.end() || it->first != param);
-  if (retval) {
-    *value = possible_value;
-  }
-
-  return retval;
-}
-
-
-// Returns -1 on error, and on success too if the parameter contains
-// -1 (so it's advised to only use it when expecting unsigned
-// parameters).
-// FIXME: at least some parameters are strictly 64 bit - we should get
-// the right size.
-int GetIntParam(const multimap<string, string>& query, const string& param) {
-  int retval(-1);
-  string value;
-  if (GetParam(query, param, &value)) {
-    errno = 0;
-    const long num(strtol(value.c_str(), /*endptr*/ NULL, 10));
-    // Detect strtol() errors or overflow/underflow when casting to
-    // retval's type clips the value. We do the following by doing it,
-    // and checking that they're still equal afterward (this will
-    // still work if we change retval's type later on).
-    retval = num;
-    if (errno || static_cast<long>(retval) != num) {
-      VLOG(1) << "over/underflow getting \"" << param << "\": " << retval
-              << ", " << num << " (" << strerror(errno) << ")";
-      retval = -1;
-    }
-  }
-
-  return retval;
-}
-
-
-}  // namespace
-
-
-HttpHandler::HttpHandler(LogLookup<LoggedCertificate>* log_lookup,
-                         const Database<LoggedCertificate>* db,
-                         const CertChecker* cert_checker, Frontend* frontend,
-                         ThreadPool* pool)
-    : log_lookup_(CHECK_NOTNULL(log_lookup)),
-      db_(CHECK_NOTNULL(db)),
-      cert_checker_(CHECK_NOTNULL(cert_checker)),
-      frontend_(frontend),
-      pool_(CHECK_NOTNULL(pool)) {
+void HttpHandler::AddProxyWrappedHandler(
+    libevent::HttpServer* server, const string& path,
+    const libevent::HttpServer::HandlerCallback& local_handler) {
+  const libevent::HttpServer::HandlerCallback stats_handler(
+      bind(&StatsHandlerInterceptor, path, local_handler, _1));
+  CHECK(server->AddHandler(path, bind(&HttpHandler::ProxyInterceptor, this,
+                                      stats_handler, _1)));
 }
 
 
 void HttpHandler::Add(libevent::HttpServer* server) {
+  CHECK_NOTNULL(server);
   // TODO(pphaneuf): An optional prefix might be nice?
   // TODO(pphaneuf): Find out which methods are CPU intensive enough
   // that they should be spun off to the thread pool.
-  CHECK(server->AddHandler("/ct/v1/get-entries",
-                           bind(&HttpHandler::GetEntries, this, _1)));
-  CHECK(server->AddHandler("/ct/v1/get-roots",
-                           bind(&HttpHandler::GetRoots, this, _1)));
-  CHECK(server->AddHandler("/ct/v1/get-proof-by-hash",
-                           bind(&HttpHandler::GetProof, this, _1)));
-  CHECK(server->AddHandler("/ct/v1/get-sth",
-                           bind(&HttpHandler::GetSTH, this, _1)));
-  CHECK(server->AddHandler("/ct/v1/get-sth-consistency",
-                           bind(&HttpHandler::GetConsistency, this, _1)));
+  AddProxyWrappedHandler(server, "/ct/v1/get-entries",
+                         bind(&HttpHandler::GetEntries, this, _1));
+  AddProxyWrappedHandler(server, "/ct/v1/get-proof-by-hash",
+                         bind(&HttpHandler::GetProof, this, _1));
+  AddProxyWrappedHandler(server, "/ct/v1/get-sth",
+                         bind(&HttpHandler::GetSTH, this, _1));
+  AddProxyWrappedHandler(server, "/ct/v1/get-sth-consistency",
+                         bind(&HttpHandler::GetConsistency, this, _1));
 
-  if (frontend_) {
-    CHECK(server->AddHandler("/ct/v1/add-chain",
-                             bind(&HttpHandler::AddChain, this, _1)));
-    CHECK(server->AddHandler("/ct/v1/add-pre-chain",
-                             bind(&HttpHandler::AddPreChain, this, _1)));
-  }
+  // Now add any sub-class handlers.
+  AddHandlers(server);
+}
+
+
+void HttpHandler::SetProxy(Proxy* proxy) {
+  LOG_IF(FATAL, proxy_) << "Attempting to re-add a Proxy.";
+  proxy_ = CHECK_NOTNULL(proxy);
 }
 
 
 void HttpHandler::GetEntries(evhttp_request* req) const {
   if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
-    return SendError(req, HTTP_BADMETHOD, "Method not allowed.");
+    return SendJsonError(event_base_, req, HTTP_BADMETHOD,
+                         "Method not allowed.");
   }
 
-  const multimap<string, string> query(ParseQuery(req));
+  const libevent::QueryParams query(libevent::ParseQuery(req));
 
-  const int tree_size(log_lookup_->GetSTH().tree_size());
-  const int start(GetIntParam(query, "start"));
-  if (start < 0 || start >= tree_size) {
-    return SendError(req, HTTP_BADREQUEST,
-                     "Missing or invalid \"start\" parameter.");
+  const int64_t start(libevent::GetIntParam(query, "start"));
+  if (start < 0) {
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Missing or invalid \"start\" parameter.");
   }
 
-  int end(GetIntParam(query, "end"));
+  int64_t end(libevent::GetIntParam(query, "end"));
   if (end < start) {
-    return SendError(req, HTTP_BADREQUEST,
-                     "Missing or invalid \"end\" parameter.");
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Missing or invalid \"end\" parameter.");
   }
-
-  // If a bigger tree size than what we have has been requested, we'll
-  // send what we have.
-  // TODO(pphaneuf): The "start < 0 || start >= tree_size" test above
-  // catches the case where the tree is empty (and return an error),
-  // we should return an empty result instead.
-  end = std::min(end, tree_size - 1);
 
   // Limit the number of entries returned in a single request.
   end = std::min(end, start + FLAGS_max_leaf_entries_per_response);
 
-  pool_->Add(bind(&HttpHandler::BlockingGetEntries, this, req, start, end));
-}
+  // Sekrit parameter to indicate that SCTs should be included too.
+  // This is non-standard, and is only used internally by other log nodes when
+  // "following" nodes with more data.
+  const bool include_scts(libevent::GetBoolParam(query, "include_scts"));
 
-
-void HttpHandler::GetRoots(evhttp_request* req) const {
-  if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
-    return SendError(req, HTTP_BADMETHOD, "Method not allowed.");
-  }
-
-  JsonArray roots;
-  multimap<string, const Cert*>::const_iterator it;
-  for (it = cert_checker_->GetTrustedCertificates().begin();
-       it != cert_checker_->GetTrustedCertificates().end(); ++it) {
-    string cert;
-    if (it->second->DerEncoding(&cert) != Cert::TRUE) {
-      LOG(ERROR) << "Cert encoding failed";
-      return SendError(req, HTTP_INTERNAL, "Serialisation failed.");
-    }
-    roots.AddBase64(cert);
-  }
-
-  JsonObject json_reply;
-  json_reply.Add("certificates", roots);
-
-  SendJsonReply(req, HTTP_OK, json_reply);
+  BlockingGetEntries(req, start, end, include_scts);
 }
 
 
 void HttpHandler::GetProof(evhttp_request* req) const {
   if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
-    return SendError(req, HTTP_BADMETHOD, "Method not allowed.");
+    return SendJsonError(event_base_, req, HTTP_BADMETHOD,
+                         "Method not allowed.");
   }
 
-  const multimap<string, string> query(ParseQuery(req));
+  const libevent::QueryParams query(libevent::ParseQuery(req));
 
   string b64_hash;
-  if (!GetParam(query, "hash", &b64_hash)) {
-    return SendError(req, HTTP_BADREQUEST,
-                     "Missing or invalid \"hash\" parameter.");
+  if (!libevent::GetParam(query, "hash", &b64_hash)) {
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Missing or invalid \"hash\" parameter.");
   }
 
   const string hash(util::FromBase64(b64_hash.c_str()));
   if (hash.empty()) {
-    return SendError(req, HTTP_BADREQUEST, "Invalid \"hash\" parameter.");
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Invalid \"hash\" parameter.");
   }
 
-  const int tree_size(GetIntParam(query, "tree_size"));
+  const int64_t tree_size(libevent::GetIntParam(query, "tree_size"));
   if (tree_size < 0 ||
-      static_cast<uint64_t>(tree_size) > log_lookup_->GetSTH().tree_size()) {
-    return SendError(req, HTTP_BADREQUEST,
-                     "Missing or invalid \"tree_size\" parameter.");
+      static_cast<int64_t>(tree_size) > log_lookup_->GetSTH().tree_size()) {
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Missing or invalid \"tree_size\" parameter.");
   }
 
   ShortMerkleAuditProof proof;
-  if (log_lookup_->AuditProof(hash, tree_size, &proof) !=
-      LogLookup<LoggedCertificate>::OK) {
-    return SendError(req, HTTP_BADREQUEST, "Couldn't find hash.");
+  if (log_lookup_->AuditProof(hash, tree_size, &proof) != LogLookup::OK) {
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Couldn't find hash.");
   }
 
   JsonArray json_audit;
@@ -372,18 +241,19 @@ void HttpHandler::GetProof(evhttp_request* req) const {
   json_reply.Add("leaf_index", proof.leaf_index());
   json_reply.Add("audit_path", json_audit);
 
-  SendJsonReply(req, HTTP_OK, json_reply);
+  SendJsonReply(event_base_, req, HTTP_OK, json_reply);
 }
 
 
 void HttpHandler::GetSTH(evhttp_request* req) const {
   if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
-    return SendError(req, HTTP_BADMETHOD, "Method not allowed.");
+    return SendJsonError(event_base_, req, HTTP_BADMETHOD,
+                         "Method not allowed.");
   }
 
   const SignedTreeHead& sth(log_lookup_->GetSTH());
 
-  VLOG(1) << "SignedTreeHead:\n" << sth.DebugString();
+  VLOG(2) << "SignedTreeHead:\n" << sth.DebugString();
 
   JsonObject json_reply;
   json_reply.Add("tree_size", sth.tree_size());
@@ -391,29 +261,30 @@ void HttpHandler::GetSTH(evhttp_request* req) const {
   json_reply.AddBase64("sha256_root_hash", sth.sha256_root_hash());
   json_reply.Add("tree_head_signature", sth.signature());
 
-  VLOG(1) << "GetSTH:\n" << json_reply.DebugString();
+  VLOG(2) << "GetSTH:\n" << json_reply.DebugString();
 
-  SendJsonReply(req, HTTP_OK, json_reply);
+  SendJsonReply(event_base_, req, HTTP_OK, json_reply);
 }
 
 
 void HttpHandler::GetConsistency(evhttp_request* req) const {
   if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
-    return SendError(req, HTTP_BADMETHOD, "Method not allowed.");
+    return SendJsonError(event_base_, req, HTTP_BADMETHOD,
+                         "Method not allowed.");
   }
 
-  const multimap<string, string> query(ParseQuery(req));
+  const libevent::QueryParams query(libevent::ParseQuery(req));
 
-  const int first(GetIntParam(query, "first"));
+  const int64_t first(libevent::GetIntParam(query, "first"));
   if (first < 0) {
-    return SendError(req, HTTP_BADREQUEST,
-                     "Missing or invalid \"first\" parameter.");
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Missing or invalid \"first\" parameter.");
   }
 
-  const int second(GetIntParam(query, "second"));
+  const int64_t second(libevent::GetIntParam(query, "second"));
   if (second < first) {
-    return SendError(req, HTTP_BADREQUEST,
-                     "Missing or invalid \"second\" parameter.");
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Missing or invalid \"second\" parameter.");
   }
 
   const vector<string> consistency(
@@ -427,77 +298,55 @@ void HttpHandler::GetConsistency(evhttp_request* req) const {
   JsonObject json_reply;
   json_reply.Add("consistency", json_cons);
 
-  SendJsonReply(req, HTTP_OK, json_reply);
+  SendJsonReply(event_base_, req, HTTP_OK, json_reply);
 }
 
 
-void HttpHandler::AddChain(evhttp_request* req) {
-  const shared_ptr<CertChain> chain(make_shared<CertChain>());
-  if (!ExtractChain(req, chain.get())) {
-    return;
-  }
-
-  pool_->Add(bind(&HttpHandler::BlockingAddChain, this, req, chain));
-}
-
-
-void HttpHandler::AddPreChain(evhttp_request* req) {
-  const shared_ptr<PreCertChain> chain(make_shared<PreCertChain>());
-  if (!ExtractChain(req, chain.get())) {
-    return;
-  }
-
-  pool_->Add(bind(&HttpHandler::BlockingAddPreChain, this, req, chain));
-}
-
-
-void HttpHandler::BlockingGetEntries(evhttp_request* req, int start,
-                                     int end) const {
+void HttpHandler::BlockingGetEntries(evhttp_request* req, int64_t start,
+                                     int64_t end, bool include_scts) const {
   JsonArray json_entries;
-  for (int i = start; i <= end; ++i) {
-    LoggedCertificate cert;
+  auto it(db_->ScanEntries(start));
+  for (int64_t i = start; i <= end; ++i) {
+    LoggedEntry entry;
 
-    if (db_->LookupByIndex(i, &cert) !=
-        Database<LoggedCertificate>::LOOKUP_OK) {
-      return SendError(req, HTTP_BADREQUEST, "Entry not found.");
+    if (!it->GetNextEntry(&entry) || entry.sequence_number() != i) {
+      break;
     }
 
     string leaf_input;
     string extra_data;
-    if (!cert.SerializeForLeaf(&leaf_input) ||
-        !cert.SerializeExtraData(&extra_data)) {
-      return SendError(req, HTTP_INTERNAL, "Serialization failed.");
+    string sct_data;
+    if (!entry.SerializeForLeaf(&leaf_input) ||
+        !entry.SerializeExtraData(&extra_data) ||
+        (include_scts &&
+         Serializer::SerializeSCT(entry.sct(), &sct_data) !=
+             cert_trans::serialization::SerializeResult::OK)) {
+      LOG(WARNING) << "Failed to serialize entry @ " << i << ":\n"
+                   << entry.DebugString();
+      return SendJsonError(event_base_, req, HTTP_INTERNAL,
+                           "Serialization failed.");
     }
 
     JsonObject json_entry;
     json_entry.AddBase64("leaf_input", leaf_input);
     json_entry.AddBase64("extra_data", extra_data);
 
+    if (include_scts) {
+      // This is non-standard for this implementation, and is currently only
+      // used by other nodes when "following" to fetch data from each other:
+      json_entry.AddBase64("sct", sct_data);
+    }
+
     json_entries.Add(&json_entry);
+  }
+
+  if (json_entries.Length() < 1) {
+    return SendJsonError(event_base_, req, HTTP_BADREQUEST,
+                         "Entry not found.");
   }
 
   JsonObject json_reply;
   json_reply.Add("entries", json_entries);
 
-  SendJsonReply(req, HTTP_OK, json_reply);
-}
-
-
-void HttpHandler::BlockingAddChain(evhttp_request* req,
-                                   const shared_ptr<CertChain>& chain) const {
-  SignedCertificateTimestamp sct;
-
-  AddChainReply(req, CHECK_NOTNULL(frontend_)
-                         ->QueueX509Entry(CHECK_NOTNULL(chain.get()), &sct),
-                sct);
-}
-
-
-void HttpHandler::BlockingAddPreChain(
-    evhttp_request* req, const shared_ptr<PreCertChain>& chain) const {
-  SignedCertificateTimestamp sct;
-
-  AddChainReply(req, CHECK_NOTNULL(frontend_)
-                         ->QueuePreCertEntry(CHECK_NOTNULL(chain.get()), &sct),
-                sct);
+  SendJsonReply(event_base_, req, HTTP_OK, json_reply);
 }

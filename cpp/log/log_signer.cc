@@ -12,6 +12,8 @@
 #include "util/util.h"
 
 using cert_trans::Verifier;
+using cert_trans::serialization::SerializeResult;
+using cert_trans::serialization::DeserializeResult;
 using ct::DigitallySigned;
 using ct::LogEntry;
 using ct::LogEntryType;
@@ -50,18 +52,25 @@ LogSigner::~LogSigner() {
 LogSigner::SignResult LogSigner::SignV1CertificateTimestamp(
     uint64_t timestamp, const string& leaf_certificate,
     const string& extensions, string* result) const {
-  string serialized_input;
-  Serializer::SerializeResult res =
-      Serializer::SerializeV1CertSCTSignatureInput(timestamp, leaf_certificate,
-                                                   extensions,
-                                                   &serialized_input);
+  SignedCertificateTimestamp sct;
+  sct.set_version(ct::V1);
+  sct.set_timestamp(timestamp);
+  sct.set_extensions(extensions);
 
-  if (res != Serializer::OK)
+  LogEntry entry;
+  entry.set_type(ct::X509_ENTRY);
+  entry.mutable_x509_entry()->set_leaf_certificate(leaf_certificate);
+
+  string serialized_input;
+  SerializeResult res =
+      Serializer::SerializeSCTSignatureInput(sct, entry, &serialized_input);
+
+  if (res != SerializeResult::OK)
     return GetSerializeError(res);
 
   DigitallySigned signature;
   Sign(serialized_input, &signature);
-  CHECK_EQ(Serializer::OK,
+  CHECK_EQ(SerializeResult::OK,
            Serializer::SerializeDigitallySigned(signature, result));
   return OK;
 }
@@ -70,20 +79,28 @@ LogSigner::SignResult LogSigner::SignV1PrecertificateTimestamp(
     uint64_t timestamp, const string& issuer_key_hash,
     const string& tbs_certificate, const string& extensions,
     string* result) const {
-  string serialized_input;
-  Serializer::SerializeResult res =
-      Serializer::SerializeV1PrecertSCTSignatureInput(timestamp,
-                                                      issuer_key_hash,
-                                                      tbs_certificate,
-                                                      extensions,
-                                                      &serialized_input);
+  SignedCertificateTimestamp sct;
+  sct.set_version(ct::V1);
+  sct.set_timestamp(timestamp);
+  sct.set_extensions(extensions);
 
-  if (res != Serializer::OK)
+  LogEntry entry;
+  entry.set_type(ct::PRECERT_ENTRY);
+  entry.mutable_precert_entry()->mutable_pre_cert()->set_issuer_key_hash(
+      issuer_key_hash);
+  entry.mutable_precert_entry()->mutable_pre_cert()->set_tbs_certificate(
+      tbs_certificate);
+
+  string serialized_input;
+  SerializeResult res =
+      Serializer::SerializeSCTSignatureInput(sct, entry, &serialized_input);
+
+  if (res != SerializeResult::OK)
     return GetSerializeError(res);
 
   DigitallySigned signature;
   Sign(serialized_input, &signature);
-  CHECK_EQ(Serializer::OK,
+  CHECK_EQ(SerializeResult::OK,
            Serializer::SerializeDigitallySigned(signature, result));
   return OK;
 }
@@ -94,10 +111,10 @@ LogSigner::SignResult LogSigner::SignCertificateTimestamp(
       << "Attempt to sign an SCT with a missing timestamp";
 
   string serialized_input;
-  Serializer::SerializeResult res =
+  SerializeResult res =
       Serializer::SerializeSCTSignatureInput(*sct, entry, &serialized_input);
 
-  if (res != Serializer::OK)
+  if (res != SerializeResult::OK)
     return GetSerializeError(res);
   Sign(serialized_input, sct->mutable_signature());
   sct->mutable_id()->set_key_id(KeyID());
@@ -105,29 +122,30 @@ LogSigner::SignResult LogSigner::SignCertificateTimestamp(
 }
 
 LogSigner::SignResult LogSigner::SignV1TreeHead(uint64_t timestamp,
-                                                uint64_t tree_size,
+                                                int64_t tree_size,
                                                 const string& root_hash,
                                                 string* result) const {
+  CHECK_GE(tree_size, 0);
   string serialized_sth;
-  Serializer::SerializeResult res =
+  SerializeResult res =
       Serializer::SerializeV1STHSignatureInput(timestamp, tree_size, root_hash,
                                                &serialized_sth);
 
-  if (res != Serializer::OK)
+  if (res != SerializeResult::OK)
     return GetSerializeError(res);
 
   DigitallySigned signature;
   Sign(serialized_sth, &signature);
-  CHECK_EQ(Serializer::OK,
+  CHECK_EQ(SerializeResult::OK,
            Serializer::SerializeDigitallySigned(signature, result));
   return OK;
 }
 
 LogSigner::SignResult LogSigner::SignTreeHead(SignedTreeHead* sth) const {
   string serialized_sth;
-  Serializer::SerializeResult res =
+  SerializeResult res =
       Serializer::SerializeSTHSignatureInput(*sth, &serialized_sth);
-  if (res != Serializer::OK)
+  if (res != SerializeResult::OK)
     return GetSerializeError(res);
   Sign(serialized_sth, sth->mutable_signature());
   sth->mutable_id()->set_key_id(KeyID());
@@ -135,26 +153,25 @@ LogSigner::SignResult LogSigner::SignTreeHead(SignedTreeHead* sth) const {
 }
 
 // static
-LogSigner::SignResult LogSigner::GetSerializeError(
-    Serializer::SerializeResult result) {
+LogSigner::SignResult LogSigner::GetSerializeError(SerializeResult result) {
   SignResult sign_result;
   switch (result) {
-    case Serializer::INVALID_ENTRY_TYPE:
+    case SerializeResult::INVALID_ENTRY_TYPE:
       sign_result = INVALID_ENTRY_TYPE;
       break;
-    case Serializer::EMPTY_CERTIFICATE:
+    case SerializeResult::EMPTY_CERTIFICATE:
       sign_result = EMPTY_CERTIFICATE;
       break;
-    case Serializer::CERTIFICATE_TOO_LONG:
+    case SerializeResult::CERTIFICATE_TOO_LONG:
       sign_result = CERTIFICATE_TOO_LONG;
       break;
-    case Serializer::INVALID_HASH_LENGTH:
+    case SerializeResult::INVALID_HASH_LENGTH:
       sign_result = INVALID_HASH_LENGTH;
       break;
-    case Serializer::UNSUPPORTED_VERSION:
+    case SerializeResult::UNSUPPORTED_VERSION:
       sign_result = UNSUPPORTED_VERSION;
       break;
-    case Serializer::EXTENSIONS_TOO_LONG:
+    case SerializeResult::EXTENSIONS_TOO_LONG:
       sign_result = EXTENSIONS_TOO_LONG;
       break;
     default:
@@ -173,19 +190,27 @@ LogSigVerifier::VerifyResult LogSigVerifier::VerifyV1CertSCTSignature(
     uint64_t timestamp, const string& leaf_cert, const string& extensions,
     const string& serialized_sig) const {
   DigitallySigned signature;
-  Deserializer::DeserializeResult result =
+  DeserializeResult result =
       Deserializer::DeserializeDigitallySigned(serialized_sig, &signature);
-  if (result != Deserializer::OK) {
+  if (result != DeserializeResult::OK) {
     LOG(WARNING) << "DeserializeDigitallySigned returned " << result;
     return GetDeserializeSignatureError(result);
   }
 
+  SignedCertificateTimestamp sct;
+  sct.set_version(ct::V1);
+  sct.set_timestamp(timestamp);
+  sct.set_extensions(extensions);
+
+  LogEntry entry;
+  entry.set_type(ct::X509_ENTRY);
+  entry.mutable_x509_entry()->set_leaf_certificate(leaf_cert);
+
   string serialized_sct;
-  Serializer::SerializeResult serialize_result =
-      Serializer::SerializeV1CertSCTSignatureInput(timestamp, leaf_cert,
-                                                   extensions,
-                                                   &serialized_sct);
-  if (serialize_result != Serializer::OK)
+  SerializeResult serialize_result =
+      Serializer::SerializeSCTSignatureInput(sct, entry, &serialized_sct);
+
+  if (serialize_result != SerializeResult::OK)
     return GetSerializeError(serialize_result);
   return ConvertStatus(Verify(serialized_sct, signature));
 }
@@ -194,18 +219,27 @@ LogSigVerifier::VerifyResult LogSigVerifier::VerifyV1PrecertSCTSignature(
     uint64_t timestamp, const string& issuer_key_hash, const string& tbs_cert,
     const string& extensions, const string& serialized_sig) const {
   DigitallySigned signature;
-  Deserializer::DeserializeResult result =
+  DeserializeResult result =
       Deserializer::DeserializeDigitallySigned(serialized_sig, &signature);
-  if (result != Deserializer::OK)
+  if (result != DeserializeResult::OK)
     return GetDeserializeSignatureError(result);
 
+  SignedCertificateTimestamp sct;
+  sct.set_version(ct::V1);
+  sct.set_timestamp(timestamp);
+  sct.set_extensions(extensions);
+
+  LogEntry entry;
+  entry.set_type(ct::PRECERT_ENTRY);
+  entry.mutable_precert_entry()->mutable_pre_cert()->set_issuer_key_hash(
+      issuer_key_hash);
+  entry.mutable_precert_entry()->mutable_pre_cert()->set_tbs_certificate(
+      tbs_cert);
+
   string serialized_sct;
-  Serializer::SerializeResult serialize_result =
-      Serializer::SerializeV1PrecertSCTSignatureInput(timestamp,
-                                                      issuer_key_hash,
-                                                      tbs_cert, extensions,
-                                                      &serialized_sct);
-  if (serialize_result != Serializer::OK)
+  SerializeResult serialize_result =
+      Serializer::SerializeSCTSignatureInput(sct, entry, &serialized_sct);
+  if (serialize_result != SerializeResult::OK)
     return GetSerializeError(serialize_result);
   return ConvertStatus(Verify(serialized_sct, signature));
 }
@@ -222,27 +256,28 @@ LogSigVerifier::VerifyResult LogSigVerifier::VerifySCTSignature(
   }
 
   string serialized_input;
-  Serializer::SerializeResult serialize_result =
+  SerializeResult serialize_result =
       Serializer::SerializeSCTSignatureInput(sct, entry, &serialized_input);
-  if (serialize_result != Serializer::OK)
+  if (serialize_result != SerializeResult::OK)
     return GetSerializeError(serialize_result);
   return ConvertStatus(Verify(serialized_input, sct.signature()));
 }
 
 LogSigVerifier::VerifyResult LogSigVerifier::VerifyV1STHSignature(
-    uint64_t timestamp, uint64_t tree_size, const string& root_hash,
+    uint64_t timestamp, int64_t tree_size, const string& root_hash,
     const string& serialized_sig) const {
+  CHECK_GE(tree_size, 0);
   DigitallySigned signature;
-  Deserializer::DeserializeResult result =
+  DeserializeResult result =
       Deserializer::DeserializeDigitallySigned(serialized_sig, &signature);
-  if (result != Deserializer::OK)
+  if (result != DeserializeResult::OK)
     return GetDeserializeSignatureError(result);
 
   string serialized_sth;
-  Serializer::SerializeResult serialize_result =
+  SerializeResult serialize_result =
       Serializer::SerializeV1STHSignatureInput(timestamp, tree_size, root_hash,
                                                &serialized_sth);
-  if (serialize_result != Serializer::OK)
+  if (serialize_result != SerializeResult::OK)
     return GetSerializeError(serialize_result);
   return ConvertStatus(Verify(serialized_sth, signature));
 }
@@ -252,34 +287,34 @@ LogSigVerifier::VerifyResult LogSigVerifier::VerifySTHSignature(
   if (sth.id().has_key_id() && sth.id().key_id() != KeyID())
     return KEY_ID_MISMATCH;
   string serialized_sth;
-  Serializer::SerializeResult serialize_result =
+  SerializeResult serialize_result =
       Serializer::SerializeSTHSignatureInput(sth, &serialized_sth);
-  if (serialize_result != Serializer::OK)
+  if (serialize_result != SerializeResult::OK)
     return GetSerializeError(serialize_result);
   return ConvertStatus(Verify(serialized_sth, sth.signature()));
 }
 
 // static
 LogSigVerifier::VerifyResult LogSigVerifier::GetSerializeError(
-    Serializer::SerializeResult result) {
+    SerializeResult result) {
   VerifyResult verify_result;
   switch (result) {
-    case Serializer::INVALID_ENTRY_TYPE:
+    case SerializeResult::INVALID_ENTRY_TYPE:
       verify_result = INVALID_ENTRY_TYPE;
       break;
-    case Serializer::EMPTY_CERTIFICATE:
+    case SerializeResult::EMPTY_CERTIFICATE:
       verify_result = EMPTY_CERTIFICATE;
       break;
-    case Serializer::CERTIFICATE_TOO_LONG:
+    case SerializeResult::CERTIFICATE_TOO_LONG:
       verify_result = CERTIFICATE_TOO_LONG;
       break;
-    case Serializer::INVALID_HASH_LENGTH:
+    case SerializeResult::INVALID_HASH_LENGTH:
       verify_result = INVALID_HASH_LENGTH;
       break;
-    case Serializer::UNSUPPORTED_VERSION:
+    case SerializeResult::UNSUPPORTED_VERSION:
       verify_result = UNSUPPORTED_VERSION;
       break;
-    case Serializer::EXTENSIONS_TOO_LONG:
+    case SerializeResult::EXTENSIONS_TOO_LONG:
       verify_result = EXTENSIONS_TOO_LONG;
       break;
     default:
@@ -290,19 +325,19 @@ LogSigVerifier::VerifyResult LogSigVerifier::GetSerializeError(
 
 // static
 LogSigVerifier::VerifyResult LogSigVerifier::GetDeserializeSignatureError(
-    Deserializer::DeserializeResult result) {
+    DeserializeResult result) {
   VerifyResult verify_result;
   switch (result) {
-    case Deserializer::INPUT_TOO_SHORT:
+    case DeserializeResult::INPUT_TOO_SHORT:
       verify_result = SIGNATURE_TOO_SHORT;
       break;
-    case Deserializer::INVALID_HASH_ALGORITHM:
+    case DeserializeResult::INVALID_HASH_ALGORITHM:
       verify_result = INVALID_HASH_ALGORITHM;
       break;
-    case Deserializer::INVALID_SIGNATURE_ALGORITHM:
+    case DeserializeResult::INVALID_SIGNATURE_ALGORITHM:
       verify_result = INVALID_SIGNATURE_ALGORITHM;
       break;
-    case Deserializer::INPUT_TOO_LONG:
+    case DeserializeResult::INPUT_TOO_LONG:
       verify_result = SIGNATURE_TOO_LONG;
       break;
     default:

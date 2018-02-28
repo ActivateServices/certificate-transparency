@@ -1,6 +1,5 @@
-/* -*- mode: c++; indent-tabs-mode: nil -*- */
-#ifndef JSON_WRAPPER_H
-#define JSON_WRAPPER_H
+#ifndef CERT_TRANS_UTIL_JSON_WRAPPER_H_
+#define CERT_TRANS_UTIL_JSON_WRAPPER_H_
 
 #include <glog/logging.h>
 #include <json.h>
@@ -42,6 +41,10 @@ class JsonObject {
   JsonObject(const JsonArray& from, int offset,
              json_type type = json_type_object);
 
+  JsonObject(const JsonObject& from, const char* field) {
+    InitFromChild(from, field, json_type_object);
+  }
+
   JsonObject() : obj_(json_object_new_object()) {
   }
 
@@ -71,7 +74,7 @@ class JsonObject {
   }
 
   void Add(const char* name, const JsonObject& addand) {
-    Add(name, addand.obj_);
+    Add(name, json_object_get(addand.obj_));
   }
 
   void Add(const char* name, int64_t value) {
@@ -89,7 +92,7 @@ class JsonObject {
   void Add(const char* name, const ct::DigitallySigned& ds) {
     std::string signature;
     CHECK_EQ(Serializer::SerializeDigitallySigned(ds, &signature),
-             Serializer::OK);
+             cert_trans::serialization::SerializeResult::OK);
     AddBase64(name, signature);
   }
 
@@ -107,6 +110,14 @@ class JsonObject {
 
  protected:
   JsonObject(const JsonObject& from, const char* field, json_type type) {
+    InitFromChild(from, field, type);
+  }
+
+  json_object* obj_;
+
+ private:
+  void InitFromChild(const JsonObject& from, const char* field,
+                     json_type type) {
     if (json_object_object_get_ex(from.obj_, field, &obj_)) {
       if (!json_object_is_type(obj_, type)) {
         LOG(ERROR) << "Don't understand " << field
@@ -115,16 +126,13 @@ class JsonObject {
         return;
       }
     } else {
-      LOG(ERROR) << "No " << field << " field";
+      VLOG(2) << "No " << field << " field";
       return;
     }
     // Increment reference count
     json_object_get(obj_);
   }
 
-  json_object* obj_;
-
- private:
   void Add(const char* name, json_object* obj) {
     json_object_object_add(obj_, name, obj);
   }
@@ -138,7 +146,7 @@ class JsonBoolean : public JsonObject {
       : JsonObject(from, field, json_type_boolean) {
   }
 
-  bool Value() {
+  bool Value() const {
     return json_object_get_boolean(obj_);
   }
 };
@@ -153,7 +161,7 @@ class JsonString : public JsonObject {
       : JsonObject(from, offset, json_type_string) {
   }
 
-  const char* Value() {
+  const char* Value() const {
     return json_object_get_string(obj_);
   }
 
@@ -205,4 +213,4 @@ class JsonArray : public JsonObject {
   }
 };
 
-#endif
+#endif  // CERT_TRANS_UTIL_JSON_WRAPPER_H_

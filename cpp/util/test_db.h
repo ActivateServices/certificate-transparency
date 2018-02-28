@@ -1,5 +1,5 @@
-#ifndef UTIL_TEST_DB_H
-#define UTIL_TEST_DB_H
+#ifndef CERT_TRANS_UTIL_TEST_DB_H_
+#define CERT_TRANS_UTIL_TEST_DB_H_
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -48,28 +48,23 @@ class TestDB {
     Setup();
   }
 
-  ~TestDB() {
-    if (db_ != NULL)
-      delete db_;
-  }
-
   void Setup();
 
   T* db() const {
-    return db_;
+    return db_.get();
   }
 
   // Build a second database from the current disk state. Caller owns result.
   // Meant to be used for testing resumes from disk.
   // Concurrent behaviour is undefined (depends on the Database
   // implementation).
-  T* SecondDB() const;
+  T* SecondDB();
 
  private:
   TmpStorage tmp_;
-  T* db_;
+  std::unique_ptr<T> db_;
 
   DISALLOW_COPY_AND_ASSIGN(TestDB);
 };
 
-#endif  // UTIL_TEST_DB_H
+#endif  // CERT_TRANS_UTIL_TEST_DB_H_

@@ -1,5 +1,5 @@
-#ifndef CERT_SUBMISSION_HANDLER_H
-#define CERT_SUBMISSION_HANDLER_H
+#ifndef CERT_TRANS_LOG_CERT_SUBMISSION_HANDLER_H_
+#define CERT_TRANS_LOG_CERT_SUBMISSION_HANDLER_H_
 
 #include <string>
 
@@ -7,6 +7,10 @@
 #include "log/cert_checker.h"
 #include "proto/ct.pb.h"
 #include "proto/serializer.h"
+#include "util/status.h"
+
+namespace cert_trans {
+
 
 // Parse incoming submissions, do preliminary sanity checks and pass them
 // through cert checker.
@@ -15,27 +19,14 @@
 class CertSubmissionHandler {
  public:
   // Does not take ownership of the cert_checker.
-  explicit CertSubmissionHandler(cert_trans::CertChecker* cert_checker);
-  ~CertSubmissionHandler() {
-  }
-
-  enum SubmitResult {
-    OK,
-    INVALID_TYPE,
-    EMPTY_SUBMISSION,
-    SUBMISSION_TOO_LONG,
-    INVALID_PEM_ENCODED_CHAIN,
-    INVALID_CERTIFICATE_CHAIN,
-    PRECERT_CHAIN_NOT_WELL_FORMED,
-    UNKNOWN_ROOT,
-    INTERNAL_ERROR,
-  };
+  explicit CertSubmissionHandler(const cert_trans::CertChecker* cert_checker);
 
   // These may change |chain|.
-  SubmitResult ProcessX509Submission(cert_trans::CertChain* chain,
-                                     ct::LogEntry* entry);
-  SubmitResult ProcessPreCertSubmission(cert_trans::PreCertChain* chain,
-                                        ct::LogEntry* entry);
+  // TODO(pphaneuf): These could return StatusOr<ct::LogEntry>.
+  util::Status ProcessX509Submission(cert_trans::CertChain* chain,
+                                     ct::LogEntry* entry) const;
+  util::Status ProcessPreCertSubmission(cert_trans::PreCertChain* chain,
+                                        ct::LogEntry* entry) const;
 
   // For clients, to reconstruct the bytestring under the signature
   // from the observed chain. Does not check whether the entry
@@ -43,18 +34,13 @@ class CertSubmissionHandler {
   static bool X509ChainToEntry(const cert_trans::CertChain& chain,
                                ct::LogEntry* entry);
 
-  const std::multimap<std::string, const cert_trans::Cert*>& GetRoots() const {
-    return cert_checker_->GetTrustedCertificates();
-  }
-
  private:
-  static bool SerializedTbs(const cert_trans::Cert& cert, std::string* result);
-  static SubmitResult GetVerifyError(
-      cert_trans::CertChecker::CertVerifyResult result);
-
-  cert_trans::CertChecker* cert_checker_;
+  const cert_trans::CertChecker* const cert_checker_;
 
   DISALLOW_COPY_AND_ASSIGN(CertSubmissionHandler);
 };
 
-#endif
+
+}  // namespace cert_trans
+
+#endif  // CERT_TRANS_LOG_CERT_SUBMISSION_HANDLER_H_

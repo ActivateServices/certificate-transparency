@@ -1,8 +1,8 @@
 // An interface for Merkle trees.  It makes it easier to write code that works
 // with all all flavors of Merkle trees.
 
-#ifndef SRC_MERKLETREE_MERKLE_TREE_INTERFACE_H_
-#define SRC_MERKLETREE_MERKLE_TREE_INTERFACE_H_
+#ifndef CERT_TRANS_MERKLETREE_MERKLE_TREE_INTERFACE_H_
+#define CERT_TRANS_MERKLETREE_MERKLE_TREE_INTERFACE_H_
 
 #include <stddef.h>
 #include <string>
@@ -15,10 +15,8 @@ namespace cert_trans {
 // merkletree/merkle_tree.h and merkletree/compact_merkle_tree.h.
 class MerkleTreeInterface {
  public:
-  MerkleTreeInterface() {
-  }
-  virtual ~MerkleTreeInterface() {
-  }
+  MerkleTreeInterface() = default;
+  virtual ~MerkleTreeInterface() = default;
 
   // Length of a node (i.e., a hash), in bytes.
   virtual size_t NodeSize() const = 0;
@@ -65,4 +63,4 @@ class MerkleTreeInterface {
 
 }  // namespace cert_trans
 
-#endif  // SRC_MERKLETREE_MERKLE_TREE_INTERFACE_H_
+#endif  // CERT_TRANS_MERKLETREE_MERKLE_TREE_INTERFACE_H_

@@ -8,92 +8,94 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <string.h>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "log/cert.h"
 #include "log/ct_extensions.h"
+#include "util/openssl_scoped_types.h"
 #include "util/openssl_util.h"  // for LOG_OPENSSL_ERRORS
 #include "util/util.h"
 
+using std::move;
+using std::multimap;
+using std::pair;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 using util::ClearOpenSSLErrors;
+using util::Status;
+using util::StatusOr;
+using util::error::Code;
 
 namespace cert_trans {
 
-CertChecker::~CertChecker() {
-  ClearAllTrustedCertificates();
-}
-
 bool CertChecker::LoadTrustedCertificates(const string& cert_file) {
   // A read-only BIO.
-  BIO* bio_in = BIO_new(BIO_s_file());
-  if (bio_in == NULL) {
+  ScopedBIO bio_in(BIO_new(BIO_s_file()));
+  if (!bio_in) {
     LOG_OPENSSL_ERRORS(ERROR);
     return false;
   }
 
-  if (BIO_read_filename(bio_in, cert_file.c_str()) <= 0) {
-    BIO_free(bio_in);
+  if (BIO_read_filename(bio_in.get(), cert_file.c_str()) <= 0) {
     LOG(ERROR) << "Failed to open file " << cert_file << " for reading";
     LOG_OPENSSL_ERRORS(ERROR);
     return false;
   }
 
-  return LoadTrustedCertificatesFromBIO(bio_in);
+  return LoadTrustedCertificatesFromBIO(bio_in.get());
 }
 
-bool CertChecker::LoadTrustedCertificates(const vector<string>& trusted_certs) {
+bool CertChecker::LoadTrustedCertificates(
+    const vector<string>& trusted_certs) {
   string concat_certs;
   for (vector<string>::const_iterator it = trusted_certs.begin();
        it != trusted_certs.end(); ++it) {
     concat_certs.append(*it);
   }
   // A read-only memory BIO.
-  BIO* bio_in = BIO_new_mem_buf(
+  ScopedBIO bio_in(BIO_new_mem_buf(
       const_cast<void*>(reinterpret_cast<const void*>(concat_certs.c_str())),
-      -1  /* no length, since null-terminated */);
-  if (bio_in == NULL) {
+      -1 /* no length, since null-terminated */));
+  if (!bio_in) {
     LOG_OPENSSL_ERRORS(ERROR);
     return false;
   }
 
-  return LoadTrustedCertificatesFromBIO(bio_in);
+  return LoadTrustedCertificatesFromBIO(bio_in.get());
 }
 
 bool CertChecker::LoadTrustedCertificatesFromBIO(BIO* bio_in) {
-  CHECK(bio_in != NULL);
-  std::vector<std::pair<string, Cert*> > certs_to_add;
+  CHECK_NOTNULL(bio_in);
+  vector<pair<string, unique_ptr<const Cert>>> certs_to_add;
   bool error = false;
   // certs_to_add may be empty if no new certs were added, so keep track of
   // successfully parsed cert count separately.
   size_t cert_count = 0;
 
   while (!error) {
-    X509* x509 = PEM_read_bio_X509(bio_in, NULL, NULL, NULL);
-    if (x509 != NULL) {
+    ScopedX509 x509(PEM_read_bio_X509(bio_in, nullptr, nullptr, nullptr));
+    if (x509) {
       // TODO(ekasper): check that the issuing CA cert is temporally valid
       // and at least warn if it isn't.
-      Cert* cert = new Cert(x509);
+      unique_ptr<Cert> cert(Cert::FromX509(move(x509)));
       string subject_name;
-      CertVerifyResult is_trusted = IsTrusted(*cert, &subject_name);
-      if (is_trusted != OK && is_trusted != ROOT_NOT_IN_LOCAL_STORE) {
-        delete cert;
+      const StatusOr<bool> is_trusted(IsTrusted(*cert, &subject_name));
+      if (!is_trusted.ok()) {
         error = true;
         break;
       }
 
       ++cert_count;
-      if (is_trusted == OK) {
-        delete cert;
-      } else {
-        certs_to_add.push_back(make_pair(subject_name, cert));
+      if (!is_trusted.ValueOrDie()) {
+        certs_to_add.push_back(make_pair(subject_name, move(cert)));
       }
     } else {
       // See if we reached the end of the file.
-      unsigned long err = ERR_peek_last_error();
+      auto err = ERR_peek_last_error();
       if (ERR_GET_LIB(err) == ERR_LIB_PEM &&
           ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
         ClearOpenSSLErrors();
@@ -108,99 +110,76 @@ bool CertChecker::LoadTrustedCertificatesFromBIO(BIO* bio_in) {
     }
   }
 
-  BIO_free(bio_in);
-
   if (error || !cert_count) {
-    while (!certs_to_add.empty()) {
-      delete certs_to_add.back().second;
-      certs_to_add.pop_back();
-    }
     return false;
   }
 
   size_t new_certs = certs_to_add.size();
   while (!certs_to_add.empty()) {
-    trusted_.insert(certs_to_add.back());
+    trusted_.insert(move(certs_to_add.back()));
     certs_to_add.pop_back();
   }
   LOG(INFO) << "Added " << new_certs << " new certificate(s) to trusted store";
+
   return true;
 }
 
-void CertChecker::ClearAllTrustedCertificates() {
-  std::multimap<string, const Cert*>::iterator it = trusted_.begin();
-  for (; it != trusted_.end(); ++it)
-    delete it->second;
-  trusted_.clear();
-}
-
-CertChecker::CertVerifyResult CertChecker::CheckCertChain(
-    CertChain* chain) const {
-  if (chain == NULL || !chain->IsLoaded())
-    return INVALID_CERTIFICATE_CHAIN;
+Status CertChecker::CheckCertChain(CertChain* chain) const {
+  if (!chain || !chain->IsLoaded())
+    return Status(util::error::INVALID_ARGUMENT, "invalid certificate chain");
 
   // Weed out things that should obviously be precert chains instead.
-  Cert::Status status =
+  const StatusOr<bool> has_poison =
       chain->LeafCert()->HasCriticalExtension(cert_trans::NID_ctPoison);
-  if (status != Cert::TRUE && status != Cert::FALSE) {
-    return CertChecker::INTERNAL_ERROR;
+  if (!has_poison.ok()) {
+    return Status(util::error::INTERNAL, "internal error");
   }
-  if (status == Cert::TRUE)
-    return PRECERT_EXTENSION_IN_CERT_CHAIN;
+  if (has_poison.ValueOrDie()) {
+    return Status(util::error::INVALID_ARGUMENT,
+                  "precert extension in certificate chain");
+  }
 
   return CheckIssuerChain(chain);
 }
 
-CertChecker::CertVerifyResult CertChecker::CheckIssuerChain(
-    CertChain* chain) const {
-  if (chain->RemoveCertsAfterFirstSelfSigned() != Cert::TRUE) {
+Status CertChecker::CheckIssuerChain(CertChain* chain) const {
+  if (!chain->RemoveCertsAfterFirstSelfSigned()) {
     LOG(ERROR) << "Failed to trim chain";
-    return INTERNAL_ERROR;
+    return Status(util::error::INTERNAL, "failed to trim chain");
   }
 
   // Note that it is OK to allow a root cert that is not CA:true
   // because we will later check that it is trusted.
-  Cert::Status status = chain->IsValidCaIssuerChainMaybeLegacyRoot();
-  if (status == Cert::FALSE)
-    return INVALID_CERTIFICATE_CHAIN;
-  if (status != Cert::TRUE) {
+  Status status = chain->IsValidCaIssuerChainMaybeLegacyRoot();
+  if (!status.ok()) {
     LOG(ERROR) << "Failed to check issuer chain";
-    return INTERNAL_ERROR;
+    return Status(status.CanonicalCode(), "invalid certificate chain");
   }
 
-  status = chain->IsValidSignatureChain();
-  if (status == Cert::UNSUPPORTED_ALGORITHM) {
-    // UNSUPPORTED_ALGORITHM can happen when a weak algorithm (such as MD2)
-    // is intentionally not accepted in which case it's correct to say that
-    // the chain is invalid.
-    // It can also happen when EVP is not properly initialized, in which case
-    // it's more of an INTERNAL_ERROR. However a bust setup would manifest
-    // itself in many other ways, including failing tests, so we assume the
-    // failure is intentional.
-    return UNSUPPORTED_ALGORITHM_IN_CERT_CHAIN;
+  const Status valid_chain(chain->IsValidSignatureChain());
+  if (!valid_chain.ok()) {
+    return valid_chain;
   }
-  if (status == Cert::FALSE)
-    return INVALID_CERTIFICATE_CHAIN;
 
-  if (status != Cert::TRUE) {
-    LOG(ERROR) << "Failed to check signature chain";
-    return INTERNAL_ERROR;
-  }
   return GetTrustedCa(chain);
 }
 
-CertChecker::CertVerifyResult CertChecker::CheckPreCertChain(
-    PreCertChain* chain, string* issuer_key_hash,
-    string* tbs_certificate) const {
-  if (chain == NULL || !chain->IsLoaded())
-    return INVALID_CERTIFICATE_CHAIN;
-  Cert::Status status = chain->IsWellFormed();
-  if (status == Cert::FALSE)
-    return PRECERT_CHAIN_NOT_WELL_FORMED;
-  if (status != Cert::TRUE) {
-    LOG(ERROR) << "Failed to check precert chain format";
-    return INTERNAL_ERROR;
+Status CertChecker::CheckPreCertChain(PreCertChain* chain,
+                                      string* issuer_key_hash,
+                                      string* tbs_certificate) const {
+  if (!chain || !chain->IsLoaded()) {
+    return Status(util::error::INVALID_ARGUMENT, "invalid certificate chain");
   }
+
+  const StatusOr<bool> chain_well_formed(chain->IsWellFormed());
+  if (chain_well_formed.ok() && !chain_well_formed.ValueOrDie()) {
+    return Status(util::error::INVALID_ARGUMENT, "prechain not well formed");
+  }
+  if (!chain_well_formed.ok()) {
+    LOG(ERROR) << "Failed to check precert chain format";
+    return Status(util::error::INTERNAL, "internal error");
+  }
+
   // Check the issuer and signature chain.
   // We do not, at this point, concern ourselves with whether the CA
   // certificate that issued the precert is a Precertificate Signing
@@ -213,148 +192,155 @@ CertChecker::CertVerifyResult CertChecker::CheckPreCertChain(
   // Precertificate Signing Certificates should be tolerated if they
   // have the necessary EKU set.
   // Preference is "no".
-  CertVerifyResult res = CheckIssuerChain(chain);
-  if (res != OK)
-    return res;
 
-  Cert::Status uses_pre_issuer = chain->UsesPrecertSigningCertificate();
-  if (uses_pre_issuer != Cert::TRUE && uses_pre_issuer != Cert::FALSE)
-    return INTERNAL_ERROR;
+  // TODO(pphaneuf): Once Cert::IsWellFormed returns a util::Status,
+  // remove the braces and re-use the one above.
+  {
+    Status status(CheckIssuerChain(chain));
+    if (!status.ok())
+      return status;
+  }
+
+  const StatusOr<bool> uses_pre_issuer =
+      chain->UsesPrecertSigningCertificate();
+  if (!uses_pre_issuer.ok()) {
+    return Status(util::error::INTERNAL, "internal error");
+  }
 
   string key_hash;
-  if (uses_pre_issuer == Cert::TRUE) {
+  if (uses_pre_issuer.ValueOrDie()) {
     if (chain->Length() < 3 ||
-        chain->CertAt(2)->SPKISha256Digest(&key_hash) != Cert::TRUE)
-      return INTERNAL_ERROR;
+        chain->CertAt(2)->SPKISha256Digest(&key_hash) != ::util::OkStatus())
+      return Status(util::error::INTERNAL, "internal error");
   } else if (chain->Length() < 2 ||
-             chain->CertAt(1)->SPKISha256Digest(&key_hash) != Cert::TRUE) {
-    return INTERNAL_ERROR;
+             chain->CertAt(1)->SPKISha256Digest(&key_hash) !=
+                 ::util::OkStatus()) {
+    return Status(util::error::INTERNAL, "internal error");
   }
   // A well-formed chain always has a precert.
   TbsCertificate tbs(*chain->PreCert());
-  if (!tbs.IsLoaded() ||
-      tbs.DeleteExtension(cert_trans::NID_ctPoison) != Cert::TRUE)
-    return INTERNAL_ERROR;
+  if (!tbs.IsLoaded() || !tbs.DeleteExtension(cert_trans::NID_ctPoison).ok()) {
+    return Status(util::error::INTERNAL, "internal error");
+  }
 
   // If the issuing cert is the special Precert Signing Certificate,
   // replace the issuer with the one that will sign the final cert.
   // Should always succeed as we've already verified that the chain
   // is well-formed.
-  if (uses_pre_issuer == Cert::TRUE &&
-      tbs.CopyIssuerFrom(*chain->PrecertIssuingCert()) != Cert::TRUE)
-    return INTERNAL_ERROR;
-
+  if (uses_pre_issuer.ValueOrDie() &&
+      !tbs.CopyIssuerFrom(*chain->PrecertIssuingCert()).ok()) {
+    return Status(util::error::INTERNAL, "internal error");
+  }
 
   string der_tbs;
-  if (tbs.DerEncoding(&der_tbs) != Cert::TRUE)
-    return INTERNAL_ERROR;
+  if (!tbs.DerEncoding(&der_tbs).ok()) {
+    return Status(util::error::INTERNAL,
+                  "could not DER-encode tbs certificate");
+  }
 
   issuer_key_hash->assign(key_hash);
   tbs_certificate->assign(der_tbs);
-  return OK;
+  return ::util::OkStatus();
 }
 
-CertChecker::CertVerifyResult CertChecker::GetTrustedCa(
-    CertChain* chain) const {
+Status CertChecker::GetTrustedCa(CertChain* chain) const {
   const Cert* subject = chain->LastCert();
-  if (subject == NULL || !subject->IsLoaded()) {
+  if (!subject) {
     LOG(ERROR) << "Chain has no valid certs";
-    return INTERNAL_ERROR;
+    return Status(util::error::INTERNAL, "chain has no valid certificate");
   }
 
   // Look up issuer from the trusted store.
   if (trusted_.empty()) {
     LOG(WARNING) << "No trusted certificates loaded";
-    return ROOT_NOT_IN_LOCAL_STORE;
+    return Status(util::error::FAILED_PRECONDITION,
+                  "no trusted certificates loaded");
   }
 
   string subject_name;
-  CertVerifyResult is_trusted = IsTrusted(*subject, &subject_name);
-  // Either an error, or OK, meaning the last cert is in our trusted store.
-  // Note the trusted cert need not necessarily be self-signed.
-  if (is_trusted != ROOT_NOT_IN_LOCAL_STORE)
-    return is_trusted;
+  const StatusOr<bool> is_trusted(IsTrusted(*subject, &subject_name));
+  // Either an error, or true, meaning the last cert is in our trusted
+  // store.  Note the trusted cert need not necessarily be
+  // self-signed.
+  if (!is_trusted.ok() || is_trusted.ValueOrDie())
+    return is_trusted.status();
 
   string issuer_name;
-  Cert::Status status = subject->DerEncodedIssuerName(&issuer_name);
-  if (status == Cert::ERROR)
-    return INTERNAL_ERROR;
-  else if (status != Cert::TRUE)
-    return INVALID_CERTIFICATE_CHAIN;
+  util::Status status = subject->DerEncodedIssuerName(&issuer_name);
+  if (status != ::util::OkStatus()) {
+    // Doesn't matter whether the extension doesn't or exist or is corrupt,
+    // it's still a bad chain
+    return Status(util::error::INVALID_ARGUMENT, "invalid certificate chain");
+  }
 
   if (subject_name == issuer_name) {
     // Self-signed: no need to scan again.
-    return ROOT_NOT_IN_LOCAL_STORE;
+    return Status(util::error::FAILED_PRECONDITION,
+                  "untrusted self-signed certificate");
   }
 
-  std::pair<std::multimap<string, const Cert*>::const_iterator,
-            std::multimap<string, const Cert*>::const_iterator> issuer_range =
-      trusted_.equal_range(issuer_name);
-
-  const Cert* issuer = NULL;
-  for (std::multimap<string, const Cert*>::const_iterator it =
+  const auto issuer_range(trusted_.equal_range(issuer_name));
+  const Cert* issuer(nullptr);
+  for (multimap<string, unique_ptr<const Cert>>::const_iterator it =
            issuer_range.first;
        it != issuer_range.second; ++it) {
-    const Cert* issuer_cand = it->second;
+    const unique_ptr<const Cert>& issuer_cand(it->second);
 
-    Cert::Status ok = subject->IsSignedBy(*issuer_cand);
-    if (ok == Cert::UNSUPPORTED_ALGORITHM) {
+    StatusOr<bool> signed_by_issuer = subject->IsSignedBy(*issuer_cand);
+    if (signed_by_issuer.status().CanonicalCode() == Code::UNIMPLEMENTED) {
       // If the cert's algorithm is unsupported, then there's no point
       // continuing: it's unconditionally invalid.
-      return UNSUPPORTED_ALGORITHM_IN_CERT_CHAIN;
+      return Status(util::error::INVALID_ARGUMENT,
+                    "unsupported algorithm in certificate chain");
     }
-    if (ok != Cert::TRUE && ok != Cert::FALSE) {
+    if (!signed_by_issuer.ok()) {
       LOG(ERROR) << "Failed to check signature for trusted root";
-      return INTERNAL_ERROR;
+      return Status(util::error::INTERNAL,
+                    "failed to check signature for trusted root");
     }
-    if (ok == Cert::TRUE) {
-      issuer = issuer_cand;
+    if (signed_by_issuer.ValueOrDie()) {
+      issuer = issuer_cand.get();
       break;
     }
   }
 
-  if (issuer == NULL)
-    return ROOT_NOT_IN_LOCAL_STORE;
+  if (!issuer) {
+    return Status(util::error::FAILED_PRECONDITION, "unknown root");
+  }
 
   // Clone creates a new Cert but AddCert takes ownership even if Clone
   // failed and the cert can't be added, so we don't have to explicitly
   // check for IsLoaded here.
-  if (chain->AddCert(issuer->Clone()) != Cert::TRUE) {
+  if (!chain->AddCert(issuer->Clone())) {
     LOG(ERROR) << "Failed to add trusted root to chain";
-    return INTERNAL_ERROR;
+    return Status(util::error::INTERNAL,
+                  "failed to add trusted root to chain");
   }
 
-  return OK;
+  return ::util::OkStatus();
 }
 
-CertChecker::CertVerifyResult CertChecker::IsTrusted(
-    const Cert& cert, string* subject_name) const {
+StatusOr<bool> CertChecker::IsTrusted(const Cert& cert,
+                                      string* subject_name) const {
   string cert_name;
-  Cert::Status status = cert.DerEncodedSubjectName(&cert_name);
-  if (status == Cert::ERROR)
-    return INTERNAL_ERROR;
-  else if (status != Cert::TRUE)
-    return INVALID_CERTIFICATE_CHAIN;
+  util::Status status = cert.DerEncodedSubjectName(&cert_name);
+  if (status != ::util::OkStatus()) {
+    // Doesn't matter whether it failed to decode or did not exist
+    return Status(util::error::INVALID_ARGUMENT, "invalid certificate chain");
+  }
 
   *subject_name = cert_name;
 
-  std::pair<std::multimap<string, const Cert*>::const_iterator,
-            std::multimap<string, const Cert*>::const_iterator> cand_range =
-      trusted_.equal_range(cert_name);
-  for (std::multimap<string, const Cert*>::const_iterator it =
-           cand_range.first;
+  const auto cand_range(trusted_.equal_range(cert_name));
+  for (multimap<string, unique_ptr<const Cert>>::const_iterator it(
+           cand_range.first);
        it != cand_range.second; ++it) {
-    const Cert* cand = it->second;
-    Cert::Status matches = cert.IsIdenticalTo(*cand);
-    if (matches != Cert::TRUE && matches != Cert::FALSE) {
-      LOG(ERROR) << "Cert comparison failed";
-      return INTERNAL_ERROR;
-    }
-    if (matches == Cert::TRUE) {
-      return OK;
+    if (cert.IsIdenticalTo(*it->second)) {
+      return true;
     }
   }
-  return ROOT_NOT_IN_LOCAL_STORE;
+  return false;
 }
+
 
 }  // namespace cert_trans

@@ -1,15 +1,16 @@
-/* -*- mode: c++; indent-tabs-mode: nil -*- */
-#ifndef HTTP_LOG_CLIENT_H
-#define HTTP_LOG_CLIENT_H
+#ifndef CERT_TRANS_CLIENT_HTTP_LOG_CLIENT_H_
+#define CERT_TRANS_CLIENT_HTTP_LOG_CLIENT_H_
 
-#include <memory>
 #include <stdint.h>
+#include <memory>
 #include <string>
 
 #include "base/macros.h"
 #include "client/async_log_client.h"
 #include "proto/ct.pb.h"
 #include "util/libevent_wrapper.h"
+#include "util/statusor.h"
+#include "util/thread_pool.h"
 
 namespace cert_trans {
 
@@ -20,27 +21,26 @@ class HTTPLogClient {
  public:
   explicit HTTPLogClient(const std::string& server);
 
-  AsyncLogClient::Status UploadSubmission(const std::string& submission,
-                                          bool pre,
-                                          ct::SignedCertificateTimestamp* sct);
+  util::StatusOr<ct::SignedCertificateTimestamp> UploadSubmission(
+      const std::string& submission, bool pre);
 
-  AsyncLogClient::Status GetSTH(ct::SignedTreeHead* sth);
+  util::StatusOr<ct::SignedTreeHead> GetSTH();
 
-  AsyncLogClient::Status GetRoots(std::vector<std::shared_ptr<Cert> >* roots);
+  util::StatusOr<std::vector<std::unique_ptr<Cert>>> GetRoots();
 
-  AsyncLogClient::Status QueryAuditProof(const std::string& merkle_leaf_hash,
-                                         ct::MerkleAuditProof* proof);
+  util::StatusOr<ct::MerkleAuditProof> QueryAuditProof(
+      const std::string& merkle_leaf_hash);
 
-  AsyncLogClient::Status GetSTHConsistency(uint64_t size1, uint64_t size2,
-                                           std::vector<std::string>* proof);
+  util::StatusOr<std::vector<std::string>> GetSTHConsistency(int64_t size1,
+                                                             int64_t size2);
 
-  // This does not clear |entries| before appending the retrieved
-  // entries.
-  AsyncLogClient::Status GetEntries(
-      int first, int last, std::vector<AsyncLogClient::Entry>* entries);
+  util::StatusOr<std::vector<AsyncLogClient::Entry>> GetEntries(int first,
+                                                                int last);
 
  private:
-  const std::shared_ptr<libevent::Base> base_;
+  const std::unique_ptr<libevent::Base> base_;
+  ThreadPool pool_;
+  UrlFetcher fetcher_;
   AsyncLogClient client_;
 
   DISALLOW_COPY_AND_ASSIGN(HTTPLogClient);
@@ -49,4 +49,4 @@ class HTTPLogClient {
 
 }  // namespace cert_trans
 
-#endif
+#endif  // CERT_TRANS_CLIENT_HTTP_LOG_CLIENT_H_

@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 
+import unittest
+
 import os
 from tempfile import mkstemp
-import unittest
 from ct.crypto import pem
 
 
@@ -165,6 +166,9 @@ class PemReaderTest(PemTest):
     def test_from_pem(self):
         self.assertEqual((self.BLOB, self.MARKER),
                          pem.from_pem(self.PEM_BLOB, (self.MARKER,)))
+        # from_pem will also take a plain string for the marker
+        self.assertEqual((self.BLOB, self.MARKER),
+                         pem.from_pem(self.PEM_BLOB, self.MARKER))
 
     def test_from_pem_file(self):
         name = self.create_temp_file(self.PEM_BLOB)

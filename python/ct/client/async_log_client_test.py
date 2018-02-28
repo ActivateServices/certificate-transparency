@@ -6,6 +6,7 @@ import sys
 import urlparse
 
 from ct.client import log_client
+from ct.client import async_log_client
 from ct.client import log_client_test_util as test_util
 from ct.client.db import database
 from twisted.internet import defer
@@ -21,7 +22,7 @@ FLAGS = gflags.FLAGS
 class ResponseBodyHandlerTest(unittest.TestCase):
     def test_send(self):
         finished = defer.Deferred()
-        handler = log_client.ResponseBodyHandler(finished)
+        handler = async_log_client.ResponseBodyHandler(finished)
         transport = proto_helpers.StringTransportWithDisconnection()
         handler.makeConnection(transport)
         transport.protocol = handler
@@ -34,7 +35,7 @@ class ResponseBodyHandlerTest(unittest.TestCase):
         test_msg = "x"*1024
         chunk_size = 100
         finished = defer.Deferred()
-        handler = log_client.ResponseBodyHandler(finished)
+        handler = async_log_client.ResponseBodyHandler(finished)
         transport = proto_helpers.StringTransportWithDisconnection()
         handler.makeConnection(transport)
         transport.protocol = handler
@@ -51,7 +52,7 @@ class ResponseBodyHandlerTest(unittest.TestCase):
         FLAGS.response_buffer_size_bytes = 10
         test_msg = "x"*11
         finished = defer.Deferred()
-        handler = log_client.ResponseBodyHandler(finished)
+        handler = async_log_client.ResponseBodyHandler(finished)
         transport = proto_helpers.StringTransportWithDisconnection()
         handler.makeConnection(transport)
         transport.protocol = handler
@@ -60,7 +61,7 @@ class ResponseBodyHandlerTest(unittest.TestCase):
         # TODO(ekasper): find a more elegant and robust way to save flags.
         FLAGS.response_buffer_size_bytes = original
         return self.assertFailure(finished,
-                                  log_client.HTTPResponseSizeExceededError)
+                                  async_log_client.HTTPResponseSizeExceededError)
 
 
 class AsyncLogClientTest(unittest.TestCase):
@@ -128,7 +129,7 @@ class AsyncLogClientTest(unittest.TestCase):
         response = self.FakeHandler.make_response(200, "OK",
                                                   json_content=json_content)
         mock_handler.get_response.return_value = response
-        return log_client.AsyncLogClient(self.FakeAgent(mock_handler),
+        return async_log_client.AsyncLogClient(self.FakeAgent(mock_handler),
                                          test_util.DEFAULT_URI,
                                          reactor=self.clock)
 
@@ -137,7 +138,7 @@ class AsyncLogClientTest(unittest.TestCase):
         # correct uri.
         if reactor_ is None:
             reactor_ = self.clock
-        return log_client.AsyncLogClient(self.FakeAgent(
+        return async_log_client.AsyncLogClient(self.FakeAgent(
             self.FakeHandler(test_util.DEFAULT_URI)), test_util.DEFAULT_URI,
                                          entries_db=entries_db,
                                          reactor=reactor_)
@@ -190,8 +191,10 @@ class AsyncLogClientTest(unittest.TestCase):
         return consumer
 
     def pump_get_entries(self,
-                     delay=FLAGS.get_entries_retry_delay,
+                     delay=None,
                      pumps=1):
+        if not delay:
+            delay = FLAGS.get_entries_retry_delay
         # Helper method which advances time past get_entries delay
         for _ in range(0, pumps):
             self.clock.pump([0, delay])
@@ -263,7 +266,7 @@ class AsyncLogClientTest(unittest.TestCase):
         self.assertTrue(test_util.verify_entries(consumer.received, 0, 9))
 
     def test_get_entries_raises_if_query_is_larger_than_tree_size(self):
-        client = log_client.AsyncLogClient(
+        client = async_log_client.AsyncLogClient(
             self.FakeAgent(self.FakeHandler(
                 test_util.DEFAULT_URI, tree_size=3)), test_util.DEFAULT_URI,
             reactor=self.clock)
@@ -278,7 +281,7 @@ class AsyncLogClientTest(unittest.TestCase):
         mock_handler.get_response.side_effect = (
             fake_responder.get_response)
 
-        client = log_client.AsyncLogClient(self.FakeAgent(mock_handler),
+        client = async_log_client.AsyncLogClient(self.FakeAgent(mock_handler),
                                            test_util.DEFAULT_URI,
                                            reactor=self.clock)
         consumer = self.get_entries(client, 0, 9, batch_size=4)
@@ -287,7 +290,7 @@ class AsyncLogClientTest(unittest.TestCase):
         self.assertEqual(3, len(mock_handler.get_response.call_args_list))
 
     def test_get_entries_returns_all_for_limiting_server(self):
-        client = log_client.AsyncLogClient(
+        client = async_log_client.AsyncLogClient(
             self.FakeAgent(
                 self.FakeHandler(test_util.DEFAULT_URI, entry_limit=3)),
             test_util.DEFAULT_URI, reactor=self.clock)
@@ -368,6 +371,21 @@ class AsyncLogClientTest(unittest.TestCase):
                             test_util.verify_entries(fake_db.entries, 0, 9))
         return consumer.consumed
 
+    class BadEntryConsumer(EntryConsumer):
+        def consume(self, entries):
+            self.received += entries
+            d = defer.Deferred()
+            d.errback(ValueError("Boom!"))
+            return d
 
-if __name__ == "__main__":
+    def test_get_entries_fires_done_if_consumer_raises(self):
+        client = self.default_client()
+        producer = client.get_entries(0, 9)
+        consumer = self.BadEntryConsumer()
+        d = producer.startProducing(consumer)
+        d.addBoth(consumer.done)
+        self.pump_get_entries()
+        self.assertTrue(consumer.result.check(ValueError))
+
+if __name__ == "__main__" or __name__ == "ct.client.async_log_client_test":
     sys.argv = FLAGS(sys.argv)

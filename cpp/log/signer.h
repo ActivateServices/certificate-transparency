@@ -1,7 +1,7 @@
 // A base class for signing unstructured data.  This class is mockable.
 
-#ifndef SRC_LOG_SIGNER_H_
-#define SRC_LOG_SIGNER_H_
+#ifndef CERT_TRANS_LOG_SIGNER_H_
+#define CERT_TRANS_LOG_SIGNER_H_
 
 #include <openssl/evp.h>
 #include <openssl/x509.h>  // for i2d_PUBKEY
@@ -9,13 +9,14 @@
 
 #include "base/macros.h"
 #include "proto/ct.pb.h"
+#include "util/openssl_scoped_types.h"
 
 namespace cert_trans {
 
 class Signer {
  public:
   explicit Signer(EVP_PKEY* pkey);
-  virtual ~Signer();
+  virtual ~Signer() = default;
 
   virtual std::string KeyID() const;
 
@@ -29,7 +30,7 @@ class Signer {
  private:
   std::string RawSign(const std::string& data) const;
 
-  EVP_PKEY* pkey_;
+  ScopedEVP_PKEY pkey_;
   ct::DigitallySigned::HashAlgorithm hash_algo_;
   ct::DigitallySigned::SignatureAlgorithm sig_algo_;
   std::string key_id_;
@@ -39,4 +40,4 @@ class Signer {
 
 }  // namespace cert_trans
 
-#endif  // SRC_LOG_SIGNER_H_
+#endif  // CERT_TRANS_LOG_SIGNER_H_

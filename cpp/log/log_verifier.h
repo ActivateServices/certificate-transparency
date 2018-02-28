@@ -1,6 +1,5 @@
-/* -*- mode: c++; indent-tabs-mode: nil -*- */
-#ifndef LOG_VERIFIER_H
-#define LOG_VERIFIER_H
+#ifndef CERT_TRANS_LOG_LOG_VERIFIER_H_
+#define CERT_TRANS_LOG_LOG_VERIFIER_H_
 
 #include <glog/logging.h>
 #include <stdint.h>
@@ -18,7 +17,7 @@ class LogVerifier {
   LogVerifier(LogSigVerifier* sig_verifier, MerkleVerifier* tree_verifier);
   ~LogVerifier();
 
-  enum VerifyResult {
+  enum LogVerifyResult {
     VERIFY_OK,
     // Invalid format
     INVALID_FORMAT,
@@ -33,7 +32,7 @@ class LogVerifier {
     INVALID_MERKLE_PATH,
   };
 
-  static std::string VerifyResultString(VerifyResult result) {
+  static std::string VerifyResultString(LogVerifyResult result) {
     switch (result) {
       case VERIFY_OK:
         return "Verify OK.";
@@ -47,9 +46,12 @@ class LogVerifier {
         return "Invalid signature.";
       case INVALID_MERKLE_PATH:
         return "Invalid Merkle path.";
-      default:
-        LOG(FATAL) << "unknown value for VerifyResult enum: " << result;
     }
+
+    LOG(FATAL) << "unknown value for LogVerifyResult enum: " << result;
+    // It should not be possible for control to reach this point but this
+    // avoids a compilation warning on some platforms.
+    abort();
   }
 
   std::string KeyID() const {
@@ -60,18 +62,18 @@ class LogVerifier {
   // and the signature is valid.
   // Timestamps are given in milliseconds, since January 1, 1970,
   // 00:00 UTC time.
-  VerifyResult VerifySignedCertificateTimestamp(
+  LogVerifyResult VerifySignedCertificateTimestamp(
       const ct::LogEntry& entry, const ct::SignedCertificateTimestamp& sct,
       uint64_t begin_range, uint64_t end_range,
       std::string* merkle_leaf_hash) const;
 
   // Verify that the timestamp is not in the future, and the signature is
   // valid.
-  VerifyResult VerifySignedCertificateTimestamp(
+  LogVerifyResult VerifySignedCertificateTimestamp(
       const ct::LogEntry& entry, const ct::SignedCertificateTimestamp& sct,
       std::string* merkle_leaf_hash) const;
 
-  VerifyResult VerifySignedCertificateTimestamp(
+  LogVerifyResult VerifySignedCertificateTimestamp(
       const ct::LogEntry& entry, const ct::SignedCertificateTimestamp& sct,
       uint64_t begin_range, uint64_t end_range) const {
     return VerifySignedCertificateTimestamp(entry, sct, begin_range, end_range,
@@ -79,7 +81,7 @@ class LogVerifier {
   }
   // Verify that the timestamp is not in the future, and the signature is
   // valid.
-  VerifyResult VerifySignedCertificateTimestamp(
+  LogVerifyResult VerifySignedCertificateTimestamp(
       const ct::LogEntry& entry,
       const ct::SignedCertificateTimestamp& sct) const {
     return VerifySignedCertificateTimestamp(entry, sct, NULL);
@@ -89,19 +91,19 @@ class LogVerifier {
   // and the signature is valid.
   // Timestamps are given in milliseconds, since January 1, 1970,
   // 00:00 UTC time.
-  VerifyResult VerifySignedTreeHead(const ct::SignedTreeHead& sth,
-                                    uint64_t begin_range,
-                                    uint64_t end_range) const;
+  LogVerifyResult VerifySignedTreeHead(const ct::SignedTreeHead& sth,
+                                       uint64_t begin_range,
+                                       uint64_t end_range) const;
 
   // Verify that the timestamp is not in the future, and the signature is
   // valid.
-  VerifyResult VerifySignedTreeHead(const ct::SignedTreeHead& sth) const;
+  LogVerifyResult VerifySignedTreeHead(const ct::SignedTreeHead& sth) const;
 
   // Verify that
   // (1) The audit proof signature is valid
   // (2) sct timestamp <= audit proof timestamp <= now
   // Does not verify the SCT signature (or even require one).
-  VerifyResult VerifyMerkleAuditProof(
+  LogVerifyResult VerifyMerkleAuditProof(
       const ct::LogEntry& entry, const ct::SignedCertificateTimestamp& sct,
       const ct::MerkleAuditProof& merkle_proof) const;
 
@@ -118,4 +120,5 @@ class LogVerifier {
 
   DISALLOW_COPY_AND_ASSIGN(LogVerifier);
 };
-#endif
+
+#endif  // CERT_TRANS_LOG_LOG_VERIFIER_H_
